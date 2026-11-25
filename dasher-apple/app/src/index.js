@@ -1,0 +1,1316 @@
+import fs from "node:fs";
+import http from "node:http";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+import { buildAreaModel, imageSignature, scanImages } from "./areas.js";
+import { HiddenDevices } from "./hidden.js";
+import { ConfigStore } from "./config.js";
+import { MenuOptionsSync } from "./menu-options.js";
+import { discoverMusicAssistant } from "./discovery.js";
+import { discoverEv, resolveEv } from "./ev.js";
+import { resolveClimate } from "./climate.js";
+import { EnergyService } from "./energy.js";
+import { isEnergyPriceState } from "./energy-prices.js";
+import { resolveWeatherBackgrounds } from "./weather.js";
+import { MealsAI, allergenWarnings } from "./meals-ai.js";
+import { FamilyStore } from "./family.js";
+import { Mealie } from "./mealie.js";
+import { OffersService } from "./offers.js";
+import { MealsStore, addDays, isDate, normalizeEntry, todayLocal, weekdayIndex, WEEKDAYS } from "./meals.js";
+import { MealsCalendar, eventSignature } from "./meals-sync.js";
+import { TodoService, cleanListName, resolveTodo } from "./todo.js";
+import { deviceEntities, deviceKeys, discoverDevices, resolveDevices } from "./devices.js";
+import { PlexService, plexBrowsers, plexConfigured, plexPlayers, validBrowse, validatePlay } from "./plex.js";
+import { PlexStreamer } from "./plex-stream.js";
+import { describeUnresolved, unresolvedEntities } from "./mapping.js";
+import { MusicService, availableTabs, DETAIL_TYPES } from "./music.js";
+import { CalendarService, buildEventInput, calendarCaps, calendarScope, parseWindow } from "./calendar.js";
+import { NowPlayingStore } from "./nowplaying.js";
+import { RadioService, radioPlayers, validateGroupRequest } from "./radio.js";
+import { HAClient } from "./ha-client.js";
+import { iconSvg } from "./icons.js";
+import { AreaPictures } from "./area-pictures.js";
+import { validateProxyPath, validateServiceCall } from "./policy.js";
+import { cameraList, legacyOptions, listPhotoAlbums, openPhoto } from "./legacy-faces.js";
+
+const here = path.dirname(fileURLToPath(import.meta.url));
+const appRoot = path.resolve(here, "..");
+const webRoot = path.join(appRoot, "web");
+const version = JSON.parse(fs.readFileSync(path.join(appRoot, "package.json"), "utf8")).version;
+
+// ---- options & environment ------------------------------------------------
+
+function readOptions() {
+  const file = process.env.OPTIONS_FILE ?? "/data/options.json";
+  try {
+    return JSON.parse(fs.readFileSync(file, "utf8"));
+  } catch {
+    return {};
+  }
+}
+
+const options = readOptions();
+const LEVELS = { debug: 0, info: 1, warning: 2, error: 3 };
+const minLevel = LEVELS[options.log_level ?? process.env.LOG_LEVEL ?? "info"] ?? 1;
+const logger = Object.fromEntries(
+  ["debug", "info", "warn", "error"].map((name) => {
+    const level = LEVELS[name === "warn" ? "warning" : name];
+    const out = name === "error" ? console.error : console.log;
+    return [name, (msg) => level >= minLevel && out(`[${new Date().toISOString()}] ${name.toUpperCase()} ${msg}`)];
+  }),
+);
+const legacySettings = legacyOptions(options);
+for (const error of legacySettings.errors) logger.warn(error);
+
+const PORT = Number(process.env.PORT ?? 8100);
+const READ_ONLY = options.read_only === true;
+const CALENDAR_EDIT = !READ_ONLY && options.allow_calendar_editing !== false && process.env.ALLOW_CALENDAR_EDITING !== "0";
+const FAMILY_EDIT = !READ_ONLY && options.allow_family_editing !== false && process.env.ALLOW_FAMILY_EDITING !== "0";
+const MEALS_EDIT = !READ_ONLY && options.allow_meal_editing !== false && process.env.ALLOW_MEAL_EDITING !== "0";
+const AREA_PICTURES = !READ_ONLY && options.allow_area_picture_upload !== false && process.env.ALLOW_AREA_PICTURE_UPLOAD !== "0";
+const AREA_EDIT = !READ_ONLY && options.allow_area_editing !== false && process.env.ALLOW_AREA_EDITING !== "0";
+const TODO_MANAGE = !READ_ONLY && options.allow_todo_management !== false && process.env.ALLOW_TODO_MANAGEMENT !== "0";
+const configDir = process.env.CONFIG_DIR ?? "/config";
+
+const supervisorToken = process.env.SUPERVISOR_TOKEN || undefined;
+const haHttpBase = supervisorToken ? "http://supervisor/core" : (process.env.HA_URL ?? "").replace(/\/$/, "");
+const haToken = supervisorToken ?? process.env.HA_TOKEN;
+if (!haHttpBase || !haToken) {
+  logger.error("No Home Assistant connection: set SUPERVISOR_TOKEN (add-on) or HA_URL and HA_TOKEN (development).");
+  process.exit(1);
+}
+const haWsUrl = supervisorToken
+  ? "ws://supervisor/core/websocket"
+  : `${haHttpBase.replace(/^http/, "ws")}/api/websocket`;
+
+// ---- state ------------------------------------------------------------------
+
+const clients = new Set();
+
+const send = (res, event, data) => res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+const broadcast = (event, data) => clients.forEach((res) => send(res, event, data));
+
+const ha = new HAClient({
+  wsUrl: haWsUrl, token: haToken, logger,
+  cacheReadOnlyState: (state) => isEnergyPriceState(state) || Object.hasOwn(state.attributes ?? {}, "charging_number_of_hours"),
+});
+const menuOptionsSync = supervisorToken ? new MenuOptionsSync({ token: supervisorToken, logger }) : null;
+const configStore = new ConfigStore({
+  dir: configDir,
+  logger,
+  entityMapOption: options.entity_map ?? process.env.ENTITY_MAP ?? [],
+  menuItemsOption: options.menu_items ?? [],
+  weatherBackgroundOption: options.weather_background !== false,
+  calendarPageOption: options.enable_calendar === true || process.env.ENABLE_CALENDAR === "1",
+  familyOption: { enabled: options.enable_family === true || process.env.ENABLE_FAMILY === "1", children: options.family_children ?? [] },
+  onChange: () => {
+    menuOptionsSync?.update(configStore.current.config);
+    rebuild({ refresh: true });
+    broadcast("config", configPayload());
+  },
+});
+const energy = new EnergyService({
+  ha, logger,
+  getEvInfoEntity: () => configStore.current.config?.ev?.roles.smart_info_entity
+    ?? discoverEv({ registries: ha.registries, index: ha.entityIndex }).smart_info_entity,
+});
+energy.on("change", () => broadcast("energy", energy.payload()));
+const radio = new RadioService({ ha, logger });
+radio.on("change", () => broadcast("music", musicPayload()));
+const music = new MusicService({
+  ha,
+  logger,
+  url: options.music_assistant_url ?? process.env.MA_URL,
+  token: options.music_assistant_token ?? process.env.MA_TOKEN,
+});
+
+// When no address is set and Music Assistant runs as a Home Assistant app, find it through the Supervisor.
+let discoveryTimer = null;
+async function discoverMusic() {
+  if (music.client.baseUrl || !supervisorToken) return;
+  const found = await discoverMusicAssistant({ token: supervisorToken, log: logger });
+  if (!found) return;
+  music.client.baseUrl = found.url;
+  clearInterval(discoveryTimer);
+  logger.info(`Music Assistant found as app ${found.slug} at ${found.url}`);
+  broadcast("music", musicPayload());
+}
+if (!music.client.baseUrl && supervisorToken) {
+  discoverMusic();
+  discoveryTimer = setInterval(discoverMusic, 60_000);
+  discoveryTimer.unref?.();
+}
+
+// ---- now playing memory -----------------------------------------------------------
+
+/** Fetch an artwork picture of a media player: HA-relative paths with the token, absolute URLs without. */
+async function fetchPicture(picture) {
+  let target;
+  const headers = {};
+  if (picture.startsWith("/") && !picture.startsWith("//")) {
+    target = haHttpBase + picture;
+    headers.Authorization = `Bearer ${haToken}`;
+  } else if (/^https?:\/\//.test(picture)) target = picture;
+  else return null;
+  const response = await fetch(target, { headers, signal: AbortSignal.timeout(10_000) });
+  const type = response.headers.get("content-type") ?? "";
+  if (!response.ok || !type.startsWith("image/")) return null;
+  return { type, body: Buffer.from(await response.arrayBuffer()) };
+}
+
+const dataDir = process.env.DATA_DIR ?? (fs.existsSync("/data") ? "/data" : null);
+const calendars = new CalendarService({ ha, logger });
+
+/** Home Assistant's REST API (list creation and removal go through the config entries API). */
+async function haRest(method, apiPath, body) {
+  const response = await fetch(haHttpBase + apiPath, {
+    method,
+    headers: { Authorization: `Bearer ${haToken}`, ...(body ? { "Content-Type": "application/json" } : {}) },
+    body: body ? JSON.stringify(body) : undefined,
+    signal: AbortSignal.timeout(15_000),
+  });
+  const text = await response.text();
+  let data = null;
+  try {
+    data = text ? JSON.parse(text) : null;
+  } catch {
+    // not JSON
+  }
+  if (!response.ok) throw new Error(data?.message ?? `HTTP ${response.status}`);
+  return data;
+}
+/** Upload a file through Home Assistant's image integration; resolves to the new image's id. */
+async function haUpload(name, buffer, type) {
+  const form = new FormData();
+  form.append("file", new Blob([buffer], { type }), name);
+  const response = await fetch(`${haHttpBase}/api/image/upload`, { method: "POST", headers: { Authorization: `Bearer ${haToken}` }, body: form, signal: AbortSignal.timeout(30_000) });
+  const data = await response.json().catch(() => null);
+  if (!response.ok) throw new Error(data?.message ?? `HTTP ${response.status}`);
+  return data?.id ?? null;
+}
+const todo = new TodoService({ ha, rest: haRest, logger });
+const plexStreamer = new PlexStreamer({ url: options.plex_url ?? process.env.PLEX_URL, token: options.plex_token ?? process.env.PLEX_TOKEN, logger });
+const plex = new PlexService({
+  ha,
+  logger,
+  streamer: plexStreamer,
+  fetchImage: async (path) => {
+    const upstream = await fetch(haHttpBase + path, { headers: { Authorization: `Bearer ${haToken}` }, signal: AbortSignal.timeout(10_000) });
+    const type = upstream.headers.get("content-type") ?? "";
+    if (!upstream.ok || !type.startsWith("image/")) return null;
+    const body = Buffer.from(await upstream.arrayBuffer());
+    return body.length > 10 * 1024 * 1024 ? null : { type, body };
+  },
+});
+const nowPlaying = new NowPlayingStore({ dir: dataDir, logger, fetchPicture });
+const hiddenDevices = new HiddenDevices({ dir: dataDir, logger });
+const areaPictures = new AreaPictures({
+  ha,
+  upload: haUpload,
+  exists: async (picture) => {
+    try {
+      return (await fetch(haHttpBase + picture, { method: "HEAD", headers: { Authorization: `Bearer ${haToken}` }, signal: AbortSignal.timeout(8000) })).ok;
+    } catch {
+      return false;
+    }
+  },
+  dir: dataDir,
+  imageDir: path.join(webRoot, "img", "rooms"),
+  logger,
+});
+nowPlaying.on("change", () => broadcast("lastplayed", nowPlaying.payload()));
+
+// ---- areas ------------------------------------------------------------------
+
+let images = { areas: new Map(), entities: new Map() };
+let imageSig = "";
+let areaModel = { areas: [], entities: new Set() };
+// Everything tablets may see or control: the dashboard's own entities plus the area pages' entities.
+let allowed = new Set();
+
+const areasPayload = () => {
+  const settings = configStore.current.config?.areas;
+  if (!settings?.enabled) return { enabled: false, areas: [] };
+  return { enabled: true, title: settings.title, icon: settings.icon, editable: AREA_EDIT, areas: areaModel.areas };
+};
+
+let radioPlayerIds = [];
+let evState = { enabled: false, roles: {} };
+let plexState = { enabled: false, players: [] };
+const plexPayload = () => (plexState.enabled ? plexState : { enabled: false, players: [] });
+const noDevices = { enabled: false, vacuums: [], appliances: [], removed: { vacuums: [], appliances: [] } };
+let devicesState = noDevices;
+const devicesPayload = () => (devicesState.enabled ? { ...devicesState, editable: AREA_EDIT } : noDevices);
+let todoState = { enabled: false, lists: [], manage: false };
+const todoPayload = () => (todoState.enabled ? todoState : { enabled: false, lists: [], manage: false });
+let climateState = { enabled: false, entities: [] };
+let weatherModel = { config: null, entities: new Set() };
+const climatePayload = () => (climateState.enabled ? climateState : { enabled: false, entities: [] });
+const evPayload = () => (evState.enabled ? evState : { enabled: false, roles: {} });
+
+/** What the Music page needs: speakers, radio stations and which tabs are usable. */
+const musicPayload = () => {
+  const settings = configStore.current.config?.music;
+  if (!settings?.enabled || radioPlayerIds.length === 0) return { enabled: false, players: [], stations: [], tabs: [], error: null };
+  return {
+    enabled: true,
+    title: settings.title,
+    icon: settings.icon,
+    default_player: settings.default_player,
+    fullscreen: settings.fullscreen,
+    players: radioPlayerIds,
+    tabs: availableTabs(settings, music.configured),
+    library: music.configured,
+    library_missing: music.client.missing,
+    ...radio.payload(),
+  };
+};
+
+/** Recompute everything derived from the config and the registries, and tell the tablets. */
+function rebuild({ refresh }) {
+  const current = configStore.current;
+  const nextWeather = resolveWeatherBackgrounds(current.config, ha.entityIndex);
+  const weatherChanged = JSON.stringify(nextWeather.config) !== JSON.stringify(weatherModel.config);
+  weatherModel = nextWeather;
+  energy.configure(current.config?.energy);
+  areaModel = buildAreaModel({
+    registries: ha.registries,
+    deviceClasses: ha.deviceClasses,
+    settings: current.config?.areas,
+    images,
+    hidden: hiddenDevices.ids,
+    builtinPictures: areaPictures.appliedAreas,
+  });
+  radioPlayerIds = radioPlayers(current.config?.music, ha.registries);
+  radio.configure(current.config?.music);
+  evState = resolveEv({
+    settings: current.config?.ev,
+    discovered: discoverEv({ registries: ha.registries, index: ha.entityIndex }),
+  });
+  climateState = resolveClimate({ settings: current.config?.climate, registries: ha.registries, index: ha.entityIndex });
+  {
+    const settings = current.config?.plex;
+    const players = plexPlayers({ settings, registries: ha.registries, streaming: plexStreamer.configured });
+    const enabled = Boolean(settings) && settings.enabled !== false && players.length > 0 && (settings.enabled === true || plexConfigured(ha.registries));
+    plexState = {
+      enabled,
+      title: settings?.title ?? null,
+      icon: settings?.icon,
+      players: enabled ? players.map((p) => p.id) : [],
+      platforms: enabled ? Object.fromEntries(players.map((p) => [p.id, p.platform])) : {},
+    };
+    plex.configure(enabled ? players : [], enabled ? plexBrowsers(ha.registries) : []);
+    plex.transcode = settings?.transcode ?? "auto";
+  }
+  devicesState = resolveDevices({ settings: current.config?.devices, discovered: discoverDevices({ registries: ha.registries, index: ha.entityIndex }), hidden: hiddenDevices.devices });
+  todoState = resolveTodo({ settings: current.config?.todo, registries: ha.registries, index: ha.entityIndex, manage: TODO_MANAGE });
+  allowed = new Set([
+    ...current.entities,
+    ...(todoState.enabled ? todoState.lists.map((l) => l.id) : []),
+    ...(devicesState.enabled ? deviceEntities(devicesState) : []),
+    ...(mealsEnabled() ? [mealsSettings().shopping].filter(Boolean) : []),
+    ...(familyEnabled() ? familyPeople().map((p) => p.entity).filter(Boolean) : []),
+    ...(calendarPageEnabled() ? calendarPageList().map((c) => c.id) : []),
+    ...areaModel.entities,
+    ...radioPlayerIds,
+    ...(evState.enabled ? Object.values(evState.roles) : []),
+    ...(climateState.enabled ? climateState.entities : []),
+    ...plexState.players,
+  ]);
+  ha.setWatched(new Set([...allowed, ...weatherModel.entities]), { refresh, required: current.entities });
+  if (weatherChanged) broadcast("config", configPayload());
+  broadcast("areas", areasPayload());
+  broadcast("music", musicPayload());
+  broadcast("ev", evPayload());
+  broadcast("climate", climatePayload());
+  broadcast("plex", plexPayload());
+  broadcast("devices", devicesPayload());
+  broadcast("meals", mealsPayload());
+  broadcast("family", familyPayload());
+  syncMealsCalendar();
+  broadcast("todo", todoPayload());
+  if (radioPlayerIds.length && (radio.stations.length === 0 || radio.error)) radio.refresh();
+}
+
+function rescanImages() {
+  const next = scanImages(configStore.assetsDir);
+  const sig = imageSignature(next);
+  if (sig === imageSig) return;
+  const first = imageSig === "";
+  imageSig = sig;
+  images = next;
+  if (!first) rebuild({ refresh: false });
+}
+
+/** The configuration for the tablets: PIN codes never leave the app. */
+function publicConfig(config) {
+  if (!config?.family?.people?.some((p) => p.pin)) return config;
+  return { ...config, family: { ...config.family, people: config.family.people.map(({ pin, ...rest }) => ({ ...rest, has_pin: Boolean(pin) })) } };
+}
+const configPayload = () => ({ config: publicConfig(weatherModel.config ?? configStore.current.config), errors: configStore.current.errors, legacy: legacySettings });
+const statusPayload = () => ({
+  ha: ha.connected,
+  readOnly: READ_ONLY,
+  missing: missingEntities().map((m) => m.id),
+});
+
+/** Entities of dashboard.yaml that Home Assistant does not know once the app option "Entity mapping" is applied. */
+function missingEntities() {
+  return unresolvedEntities({ rawEntities: configStore.current.rawEntities, map: configStore.entityMap, index: ha.entityIndex });
+}
+
+let missingSignature = "";
+/** Tell the log what is missing, with guesses to use in the option; once per distinct set. */
+function reportMissing() {
+  const unresolved = missingEntities();
+  const signature = JSON.stringify(unresolved);
+  if (signature === missingSignature) return;
+  missingSignature = signature;
+  for (const line of describeUnresolved({ unresolved, usage: configStore.current.usage, index: ha.entityIndex, registries: ha.registries })) logger.warn(line);
+}
+
+/** Give areas without a picture a built-in room picture in Home Assistant itself (once, after the registries load). */
+let pictureTimer = null;
+function scheduleAreaPictures() {
+  if (!AREA_PICTURES) return;
+  clearTimeout(pictureTimer);
+  pictureTimer = setTimeout(async () => {
+    const settings = configStore.current.config?.areas;
+    if (!settings || settings.enabled === false || settings.default_images === false || !ha.registries?.areas?.length) return;
+    const rooms = {};
+    for (const [key, o] of Object.entries(settings.overrides ?? {})) if (o.room) rooms[key.toLowerCase()] = o.room;
+    if ((await areaPictures.sync(ha.registries.areas, { rooms })) > 0) rebuild({ refresh: false });
+  }, 3000);
+  pictureTimer.unref?.();
+}
+
+ha.on("registries", () => {
+  rebuild({ refresh: false });
+  scheduleAreaPictures();
+  logger.info(`Area pages: ${areaModel.areas.length} areas, ${areaModel.entities.size} entities`);
+});
+ha.on("status", (connected) => {
+  broadcast("status", statusPayload());
+  if (connected) {
+    energy.clear();
+    energy.configure(configStore.current.config?.energy);
+    energy.refresh();
+  }
+});
+ha.on("state", (state) => {
+  nowPlaying.observe(state);
+  broadcast("state", state);
+});
+ha.on("snapshot", (states) => {
+  for (const state of states.values()) nowPlaying.observe(state);
+  reportMissing();
+  broadcast("status", statusPayload());
+  broadcast("snapshot", Object.fromEntries(states));
+});
+
+// ---- http helpers -----------------------------------------------------------
+
+const MIME = {
+  ".html": "text/html; charset=utf-8",
+  ".js": "text/javascript; charset=utf-8",
+  ".css": "text/css; charset=utf-8",
+  ".json": "application/json; charset=utf-8",
+  ".svg": "image/svg+xml",
+  ".png": "image/png",
+  ".jpg": "image/jpeg",
+  ".jpeg": "image/jpeg",
+  ".webp": "image/webp",
+  ".gif": "image/gif",
+  ".avif": "image/avif",
+  ".woff2": "font/woff2",
+  ".ico": "image/x-icon",
+};
+
+function json(res, status, body) {
+  const text = JSON.stringify(body);
+  res.writeHead(status, { "Content-Type": MIME[".json"], "Cache-Control": "no-store" });
+  res.end(text);
+}
+
+function readBody(req, limit = 16 * 1024) {
+  return new Promise((resolve, reject) => {
+    let size = 0;
+    const chunks = [];
+    req.on("data", (chunk) => {
+      size += chunk.length;
+      if (size > limit) {
+        reject(Object.assign(new Error("Body too large."), { status: 413 }));
+        req.destroy();
+      } else chunks.push(chunk);
+    });
+    req.on("end", () => resolve(Buffer.concat(chunks).toString("utf8")));
+    req.on("error", reject);
+  });
+}
+
+function serveFile(res, root, relPath, cacheControl) {
+  let decoded;
+  try {
+    decoded = decodeURIComponent(relPath);
+  } catch {
+    return json(res, 400, { error: "Bad path." });
+  }
+  const file = path.resolve(root, "." + path.posix.normalize("/" + decoded));
+  if (file !== root && !file.startsWith(root + path.sep)) return json(res, 403, { error: "Forbidden." });
+  fs.stat(file, (err, st) => {
+    if (err || !st.isFile()) return json(res, 404, { error: "Not found." });
+    res.writeHead(200, {
+      "Content-Type": MIME[path.extname(file).toLowerCase()] ?? "application/octet-stream",
+      "Content-Length": st.size,
+      "Cache-Control": cacheControl,
+    });
+    fs.createReadStream(file).pipe(res);
+  });
+}
+
+async function proxyImage(res, requestedPath, cacheControl = "private, max-age=300") {
+  if (!validateProxyPath(requestedPath)) return json(res, 400, { error: "Path not allowed." });
+  try {
+    const upstream = await fetch(haHttpBase + requestedPath, {
+      headers: { Authorization: `Bearer ${haToken}` },
+      signal: AbortSignal.timeout(10_000),
+    });
+    const type = upstream.headers.get("content-type") ?? "";
+    if (!upstream.ok || !type.startsWith("image/")) return json(res, 404, { error: "No image." });
+    const limit = 10 * 1024 * 1024;
+    if (Number(upstream.headers.get("content-length")) > limit) {
+      await upstream.body?.cancel();
+      return json(res, 413, { error: "Image too large." });
+    }
+    const chunks = [];
+    let size = 0;
+    if (upstream.body) {
+      const reader = upstream.body.getReader();
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        size += value.byteLength;
+        if (size > limit) {
+          await reader.cancel();
+          return json(res, 413, { error: "Image too large." });
+        }
+        chunks.push(Buffer.from(value));
+      }
+    }
+    const buf = Buffer.concat(chunks, size);
+    res.writeHead(200, { "Content-Type": type, "Content-Length": buf.length, "Cache-Control": cacheControl });
+    res.end(buf);
+  } catch (err) {
+    logger.debug(`Image proxy failed: ${err.message}`);
+    json(res, 502, { error: "Upstream failed." });
+  }
+}
+
+async function handleLegacyPhotos(res) {
+  if (!legacySettings.photos) return json(res, 403, { error: "Legacy photos are disabled in app configuration." });
+  try {
+    return json(res, 200, await listPhotoAlbums(configStore.assetsDir, legacySettings.albums));
+  } catch (err) {
+    logger.warn(`Legacy photos failed: ${err.message}`);
+    return json(res, err.status ?? 500, { error: err.status ? err.message : "Could not read photo albums." });
+  }
+}
+
+async function handleLegacyPhoto(req, res, params) {
+  if (!legacySettings.photos) return json(res, 403, { error: "Legacy photos are disabled in app configuration." });
+  try {
+    const photo = await openPhoto(configStore.assetsDir, params.get("album") ?? "", params.get("name"), legacySettings.albums);
+    res.writeHead(200, { "Content-Type": MIME[photo.extension], "Content-Length": photo.size, "Cache-Control": "private, max-age=60" });
+    if (req.method === "HEAD") { await photo.handle.close(); return res.end(); }
+    const stream = photo.handle.createReadStream();
+    stream.on("error", (err) => { logger.warn(`Legacy photo stream failed: ${err.message}`); res.destroy(); });
+    return stream.pipe(res);
+  } catch (err) {
+    logger.warn(`Legacy photo failed: ${err.message}`);
+    return json(res, err.status ?? 500, { error: err.status ? err.message : "Could not read photo." });
+  }
+}
+
+function handleLegacyCameras(res) {
+  if (!legacySettings.cameras) return json(res, 403, { error: "Legacy cameras are disabled in app configuration." });
+  if (!ha.connected) return json(res, 503, { error: "Home Assistant is disconnected." });
+  return json(res, 200, { cameras: cameraList(ha.entityIndex, true) });
+}
+
+async function handleLegacyCamera(res, id) {
+  if (!legacySettings.cameras) return json(res, 403, { error: "Legacy cameras are disabled in app configuration." });
+  if (!ha.connected) return json(res, 503, { error: "Home Assistant is disconnected." });
+  if (!cameraList(ha.entityIndex, true).some((camera) => camera.id === id)) return json(res, 404, { error: "Unknown camera." });
+  return proxyImage(res, `/api/camera_proxy/${encodeURIComponent(id)}`, "private, max-age=10");
+}
+
+function handleEvents(req, res) {
+  res.writeHead(200, {
+    "Content-Type": "text/event-stream",
+    "Cache-Control": "no-store",
+    Connection: "keep-alive",
+    "X-Accel-Buffering": "no",
+  });
+  res.write("retry: 3000\n\n");
+  send(res, "hello", { version });
+  send(res, "status", statusPayload());
+  send(res, "config", configPayload());
+  send(res, "areas", areasPayload());
+  send(res, "music", musicPayload());
+  send(res, "ev", evPayload());
+  send(res, "climate", climatePayload());
+  send(res, "energy", energy.payload());
+  send(res, "plex", plexPayload());
+  send(res, "devices", devicesPayload());
+  send(res, "meals", mealsPayload());
+  send(res, "family", familyPayload());
+  send(res, "todo", todoPayload());
+  send(res, "lastplayed", nowPlaying.payload());
+  send(res, "snapshot", Object.fromEntries(ha.states));
+  clients.add(res);
+  req.on("close", () => clients.delete(res));
+}
+
+async function handleService(req, res) {
+  if (READ_ONLY) return json(res, 403, { error: "The add-on is in read-only mode." });
+  let body;
+  try {
+    body = JSON.parse(await readBody(req));
+  } catch (err) {
+    return json(res, err.status ?? 400, { error: err.message || "Invalid JSON." });
+  }
+  const check = validateServiceCall(body, allowed);
+  if (!check.ok) return json(res, 400, { error: check.error });
+  try {
+    await ha.callService(check.domain, check.service, check.data, check.entityIds);
+    logger.debug(`${check.domain}.${check.service} ${check.entityIds.join(",")}`);
+    json(res, 200, { ok: true });
+  } catch (err) {
+    logger.warn(`Service call failed: ${err.message}`);
+    json(res, 502, { error: err.message });
+  }
+}
+
+async function handleRadioPlay(req, res) {
+  if (READ_ONLY) return json(res, 403, { error: "The add-on is in read-only mode." });
+  let body;
+  try {
+    body = JSON.parse(await readBody(req));
+  } catch (err) {
+    return json(res, err.status ?? 400, { error: err.message || "Invalid JSON." });
+  }
+  if (typeof body?.entity_id !== "string" || !radioPlayerIds.includes(body.entity_id)) {
+    return json(res, 400, { error: "That is not a Music Assistant player on the radio page." });
+  }
+  if (typeof body.station !== "string") return json(res, 400, { error: "station is required." });
+  try {
+    await radio.play(body.entity_id, body.station);
+    logger.debug(`radio ${body.station} -> ${body.entity_id}`);
+    json(res, 200, { ok: true });
+  } catch (err) {
+    logger.warn(`Radio playback failed: ${err.message}`);
+    json(res, err.status ?? 502, { error: err.message });
+  }
+}
+
+async function handleRadioGroup(req, res) {
+  if (READ_ONLY) return json(res, 403, { error: "The add-on is in read-only mode." });
+  let body;
+  try {
+    body = JSON.parse(await readBody(req));
+  } catch (err) {
+    return json(res, err.status ?? 400, { error: err.message || "Invalid JSON." });
+  }
+  const check = validateGroupRequest(body, radioPlayerIds);
+  if (!check.ok) return json(res, 400, { error: check.error });
+  try {
+    await radio.group(check.leader, check);
+    logger.debug(`radio group ${check.leader} +${check.add.join(",")} -${check.remove.join(",")}`);
+    json(res, 200, { ok: true });
+  } catch (err) {
+    logger.warn(`Speaker grouping failed: ${err.message}`);
+    json(res, 502, { error: err.message });
+  }
+}
+
+const sendImage = (res, image) => {
+  res.writeHead(200, { "Content-Type": image.type, "Content-Length": image.body.length, "Cache-Control": "public, max-age=86400" });
+  res.end(image.body);
+};
+
+async function handlePlexGet(res, p, params) {
+  if (!plexState.enabled) return json(res, 503, { error: "The Media page is not available." });
+  try {
+    if (p === "/api/plex/home") return json(res, 200, await plex.home());
+    if (p === "/api/plex/browse") {
+      const query = { id: params.get("id"), type: params.get("type") };
+      if (!validBrowse(query)) return json(res, 400, { error: "Cannot browse that item." });
+      return json(res, 200, await plex.children(query.id, query.type));
+    }
+    const image = /^\/api\/plex\/image\/([A-Za-z0-9]+)\/(\d+)$/.exec(p);
+    if (image) {
+      const picture = await plex.image(image[1], image[2]);
+      if (!picture) return json(res, 404, { error: "No image." });
+      res.writeHead(200, { "Content-Type": picture.type, "Content-Length": picture.body.length, "Cache-Control": "private, max-age=86400" });
+      return res.end(picture.body);
+    }
+    return json(res, 404, { error: "Not found." });
+  } catch (err) {
+    logger.warn(`Plex request failed: ${err.message}`);
+    return json(res, 502, { error: err.message });
+  }
+}
+
+async function handlePlexPlay(req, res) {
+  if (READ_ONLY) return json(res, 403, { error: "The add-on is in read-only mode." });
+  if (!plexState.enabled) return json(res, 503, { error: "The Media page is not available." });
+  let body;
+  try {
+    body = JSON.parse(await readBody(req));
+  } catch (err) {
+    return json(res, err.status ?? 400, { error: err.message || "Invalid JSON." });
+  }
+  const check = validatePlay(body ?? {}, plex.players);
+  if (!check.ok) return json(res, 400, { error: check.error });
+  try {
+    await plex.play(check.entityId, check.id, check.type, check.player);
+    logger.info(`Plex: playing ${check.id} on ${check.entityId}`);
+    return json(res, 200, { ok: true });
+  } catch (err) {
+    logger.warn(`Plex play failed: ${err.message}`);
+    return json(res, 502, { error: err.message });
+  }
+}
+
+const todoList = (id) => todoState.lists.find((l) => l.id === id);
+
+async function handleTodoGet(res, params) {
+  const id = params.get("entity_id");
+  const forMeals = mealsEnabled() && id === mealsSettings().shopping; // the meal plan reads its shopping list too
+  if (!forMeals && (!todoState.enabled || !todoList(id))) return json(res, 404, { error: "Unknown list." });
+  try {
+    return json(res, 200, await todo.items(id));
+  } catch (err) {
+    logger.warn(`To-do list ${id} could not be read: ${err.message}`);
+    return json(res, 502, { error: err.message });
+  }
+}
+
+/** Create, rename and delete lists (only Local To-do lists can be changed). */
+async function handleTodoManage(req, res, action) {
+  if (!todoState.enabled) return json(res, 503, { error: "The to-do page is not available." });
+  if (!TODO_MANAGE) return json(res, 403, { error: "Changing lists is switched off." });
+  let body;
+  try {
+    body = JSON.parse(await readBody(req));
+  } catch (err) {
+    return json(res, err.status ?? 400, { error: err.message || "Invalid JSON." });
+  }
+  try {
+    if (action === "create") {
+      const name = cleanListName(body?.name);
+      if (!name) return json(res, 400, { error: "Give the list a name of 1 to 60 characters." });
+      await todo.createList(name);
+      logger.info(`To-do list "${name}" created`);
+      return json(res, 200, { ok: true });
+    }
+    const list = todoList(body?.entity_id);
+    if (!list) return json(res, 404, { error: "Unknown list." });
+    if (!list.managed) return json(res, 400, { error: "Only lists of the Local To-do integration can be changed here." });
+    if (action === "rename") {
+      const name = cleanListName(body?.name);
+      if (!name) return json(res, 400, { error: "Give the list a name of 1 to 60 characters." });
+      await todo.renameList(list.id, name);
+      logger.info(`To-do list ${list.id} renamed to "${name}"`);
+    } else {
+      await todo.deleteList(list.id);
+      logger.info(`To-do list ${list.id} deleted`);
+    }
+    return json(res, 200, { ok: true });
+  } catch (err) {
+    logger.warn(`To-do ${action} failed: ${err.message}`);
+    return json(res, err.status ?? 502, { error: err.message });
+  }
+}
+
+// ---- meal plan (Madplan) ---------------------------------------------------------------------------
+
+const meals = new MealsStore({ dir: dataDir, logger });
+const mealsCalendar = new MealsCalendar({ ha, logger });
+
+/** What the meal plan uses from Home Assistant: the AI Task, the shopping list and the calendar. */
+function mealsSettings() {
+  const cfg = configStore.current.config?.meals;
+  const ids = [...ha.entityIndex.keys()];
+  const registry = ha.registries?.entities ?? [];
+  const todos = ids.filter((id) => id.startsWith("todo.")).sort();
+  const shopping = cfg?.shopping_list_entity ?? registry.find((e) => e.pl === "shopping_list" && e.ei.startsWith("todo."))?.ei ?? todos[0] ?? null;
+  return {
+    cfg,
+    ai: cfg?.ai_task_entity ?? ids.filter((id) => id.startsWith("ai_task.")).sort()[0] ?? null,
+    shopping,
+    calendar: cfg?.calendar_entity ?? (ids.includes("calendar.family") ? "calendar.family" : null), // the shared family calendar unless another is chosen
+    household: cfg?.household ?? 4,
+    dinner_time: cfg?.dinner_time ?? "18:00",
+    language: cfg?.language ?? configStore.current.config?.language ?? "da",
+  };
+}
+
+const offers = new OffersService({ dir: dataDir, logger, baseUrl: process.env.OFFERS_BASE_URL || undefined });
+offers.on("change", () => broadcast("meals", mealsPayload()));
+if (!process.env.NO_OFFERS) offers.start();
+const mealie = new Mealie({ ha, logger, settings: () => configStore.current.config?.meals?.mealie ?? {} });
+const mealsAi = new MealsAI({ ha, store: meals, logger, resolveEntity: () => mealsSettings().ai, settings: mealsSettings, mealie });
+const refreshMealie = () => mealie.refresh({ force: true }).then(() => broadcast("meals", mealsPayload()));
+ha.on("status", (up) => up && refreshMealie().catch(() => {}));
+setInterval(() => mealie.refresh().catch(() => {}), 5 * 60_000).unref();
+
+const mealsEnabled = () => {
+  const { cfg, ai, shopping } = mealsSettings();
+  if (!cfg || cfg.enabled === false) return false;
+  return cfg.enabled === true || Boolean(ai || shopping);
+};
+
+const mealsPayload = () => {
+  if (!mealsEnabled()) return { enabled: false };
+  const s = mealsSettings();
+  const today = todayLocal();
+  const days = Object.fromEntries(Object.entries(meals.payload().days).filter(([date]) => date >= addDays(today, -14) && date <= addDays(today, 42)));
+  return {
+    enabled: true,
+    title: s.cfg.title,
+    icon: s.cfg.icon,
+    editable: MEALS_EDIT,
+    household: s.household,
+    dinner_time: s.dinner_time,
+    ai: Boolean(s.ai) && MEALS_EDIT,
+    shopping_list: s.shopping,
+    calendar: s.calendar,
+    calendar_error: mealsCalendar.error,
+    mealie: mealie.available,
+    offers: s.cfg.offers?.enabled === false ? null : { ...offers.payload({ count: s.cfg.offers?.count ?? 5 }), editable: MEALS_EDIT },
+    ...meals.payload(),
+    days,
+  };
+};
+
+/** Keep the calendar in step with the plan: only days from today on, only what changed. */
+const calendarSynced = new Map(); // date -> signature
+function syncMealsCalendar() {
+  const { calendar, dinner_time: time } = mealsSettings();
+  if (!calendar || !mealsEnabled()) return;
+  const today = todayLocal();
+  const dates = new Set([...meals.days.keys(), ...calendarSynced.keys()]);
+  for (const date of dates) {
+    if (date < today) continue;
+    const entry = meals.days.get(date);
+    const signature = eventSignature(entry, time);
+    if (calendarSynced.get(date) === signature || (signature === "null" && !calendarSynced.has(date))) continue;
+    calendarSynced.set(date, signature);
+    mealsCalendar.syncDay(calendar, date, entry, time).then((ok) => {
+      if (!ok) calendarSynced.delete(date);
+      else if (signature === "null") calendarSynced.delete(date);
+      broadcast("meals", mealsPayload());
+    });
+  }
+}
+meals.on("change", () => {
+  broadcast("meals", mealsPayload());
+  syncMealsCalendar();
+});
+
+let lastAutoPlan = "";
+/** `meals: auto:` makes next week's plan on the chosen weekday and time, when that week has no dinners yet. */
+function maybeAutoPlan() {
+  const { cfg, ai } = mealsSettings();
+  if (!cfg?.auto || !ai || !MEALS_EDIT || meals.job.status === "running") return;
+  const now = new Date();
+  const stamp = `${todayLocal(now)} ${String(now.getHours()).padStart(2, "0")}:${String(now.getMinutes()).padStart(2, "0")}`;
+  if (WEEKDAYS[weekdayIndex(todayLocal(now))] !== cfg.auto.weekday || stamp.slice(11) < cfg.auto.time || lastAutoPlan === todayLocal(now)) return;
+  const monday = addDays(todayLocal(now), 7 - weekdayIndex(todayLocal(now)));
+  lastAutoPlan = todayLocal(now);
+  if ([...meals.days.values()].some((d) => d.kind === "dinner" && d.date >= monday && d.date < addDays(monday, 7))) return;
+  logger.info(`Making next week's meal plan (from ${monday})`);
+  mealsAi.generatePlan({ start: monday, days: cfg.auto.days }).catch(() => {});
+}
+setInterval(maybeAutoPlan, 60_000).unref();
+
+/** The recipe collection in Mealie, searched with `?q=`. */
+async function handleCookbook(res, params) {
+  if (!mealsEnabled()) return json(res, 503, { error: "The meal plan is not available." });
+  try {
+    return json(res, 200, { recipes: await mealie.search(String(params.get("q") ?? "").slice(0, 100), 60) });
+  } catch (err) {
+    return json(res, err.status ?? 502, { error: err.message });
+  }
+}
+
+async function handleMealsPost(req, res, action) {
+  if (!mealsEnabled()) return json(res, 503, { error: "The meal plan is not available." });
+  if (!MEALS_EDIT) return json(res, 403, { error: "Editing the meal plan is switched off." });
+  let body;
+  try {
+    body = JSON.parse(await readBody(req, 64 * 1024));
+  } catch (err) {
+    return json(res, err.status ?? 400, { error: err.message || "Invalid JSON." });
+  }
+  try {
+    switch (action) {
+      case "day": {
+        if (!isDate(body?.date)) return json(res, 400, { error: "Invalid date." });
+        if (body.entry == null) {
+          meals.setDay(body.date, null);
+          return json(res, 200, { ok: true });
+        }
+        const entry = meals.setDay(body.date, { ...body.entry, source: ["ai", "mealie"].includes(body.entry.source) ? body.entry.source : "manual" });
+        return entry ? json(res, 200, { ok: true, entry }) : json(res, 400, { error: "A dinner needs a name." });
+      }
+      case "prefs":
+        return json(res, 200, { ok: true, prefs: meals.setPrefs(body?.prefs) });
+      case "rate":
+        return meals.rate(body?.name, body?.rating ?? null) ? json(res, 200, { ok: true }) : json(res, 400, { error: "Invalid rating." });
+      case "generate": {
+        if (!mealsAi.available) return json(res, 503, { error: "No AI Task is set up in Home Assistant." });
+        if (meals.job.status === "running") return json(res, 409, { error: "A plan is already being made." });
+        if (!isDate(body?.start)) return json(res, 400, { error: "Choose a start day." });
+        const request = {
+          start: body.start,
+          days: body.days,
+          skip: (Array.isArray(body.skip) ? body.skip : []).filter(isDate),
+          wishes: String(body.wishes ?? "").slice(0, 500),
+          surprise: body.surprise === true,
+          cookbook: body.cookbook === true,
+        };
+        mealsAi.generatePlan(request).catch(() => {}); // runs on; the job state tells the tablets how it goes
+        return json(res, 202, { ok: true });
+      }
+      case "recipe":
+        if (!mealsAi.available) return json(res, 503, { error: "No AI Task is set up in Home Assistant." });
+        if (!isDate(body?.date)) return json(res, 400, { error: "Invalid date." });
+        await mealsAi.writeRecipe(body.date);
+        return json(res, 200, { ok: true });
+      case "offers-add": {
+        if (mealsSettings().cfg.offers?.enabled === false) return json(res, 404, { error: "Offers are switched off." });
+        const slug = await offers.add({ input: body?.input, name: body?.name, must: body?.must, not: body?.not });
+        return json(res, 200, { ok: true, slug });
+      }
+      case "offers-remove":
+        return offers.remove(String(body?.slug ?? "")) ? json(res, 200, { ok: true }) : json(res, 404, { error: "Unknown product." });
+      case "offers-chain":
+        return offers.setChain(body?.chain, body?.hidden === true) ? json(res, 200, { ok: true }) : json(res, 400, { error: "Unknown store." });
+      case "offers-refresh":
+        if (!offers.canRefreshNow) return json(res, 429, { error: "Offers were just refreshed. Try again in a few minutes." });
+        offers.refreshNow().catch((err) => logger.warn(`Offers refresh failed: ${err.message}`)); // runs on; the tablets get the result when it is in
+        return json(res, 202, { ok: true });
+      case "mealie-use": {
+        if (!isDate(body?.date)) return json(res, 400, { error: "Invalid date." });
+        const entry = await mealie.recipe(body?.slug, mealsSettings().household);
+        const warnings = allergenWarnings(normalizeEntry({ ...entry, date: body.date }, body.date), meals.prefs);
+        const saved = meals.setDay(body.date, { ...entry, kind: "dinner", ...(warnings.length ? { warnings } : {}) });
+        return saved ? json(res, 200, { ok: true, entry: saved }) : json(res, 400, { error: "The recipe could not be used." });
+      }
+      case "mealie-import": {
+        const slug = await mealie.importUrl(String(body?.url ?? "").trim());
+        return json(res, 200, { ok: true, slug });
+      }
+      case "alternatives":
+        if (!mealsAi.available) return json(res, 503, { error: "No AI Task is set up in Home Assistant." });
+        if (!isDate(body?.date)) return json(res, 400, { error: "Invalid date." });
+        return json(res, 200, { alternatives: await mealsAi.alternatives(body.date) });
+      default:
+        return json(res, 404, { error: "Not found." });
+    }
+  } catch (err) {
+    logger.warn(`Meal plan ${action} failed: ${err.message}`);
+    return json(res, err.status ?? 502, { error: err.message });
+  }
+}
+
+// ---- family board -----------------------------------------------------------------------------
+
+const FAMILY_COLORS = ["#38bdf8", "#fb923c", "#a78bfa", "#f472b6", "#4ade80", "#facc15", "#f87171", "#2dd4bf"];
+const familyEnabled = () => Boolean(configStore.current.config?.family?.enabled);
+
+/** The people of the family page: the configured ones, or every person entity of Home Assistant. */
+function familyPeople() {
+  const cfg = configStore.current.config?.family;
+  if (!cfg?.enabled) return [];
+  const nameOf = (entity, fallback) => ha.states.get(entity)?.attributes?.friendly_name ?? ha.entityIndex.get(entity)?.name ?? fallback;
+  const children = new Set(cfg.children ?? []);
+  const base = cfg.people.length
+    ? cfg.people
+    : [...ha.entityIndex.keys()].filter((id) => id.startsWith("person.")).sort().map((entity) => ({ id: entity.slice("person.".length), entity, name: null, color: null, avatar: null, role: children.has(entity) ? "child" : "adult", pin: null, calendar: null }));
+  return base.map((p, i) => ({ ...p, name: p.name ?? (p.entity ? nameOf(p.entity, p.id) : p.id), color: p.color ?? FAMILY_COLORS[i % FAMILY_COLORS.length] }));
+}
+
+const family = new FamilyStore({ dir: dataDir, logger, people: familyPeople, allowNegative: () => configStore.current.config?.family?.allow_negative === true });
+family.on("change", () => broadcast("family", familyPayload()));
+setInterval(() => family.tick(), 10 * 60_000).unref();
+
+function familyPayload() {
+  const cfg = configStore.current.config?.family;
+  if (!cfg?.enabled) return { enabled: false };
+  return { enabled: true, title: cfg.title, icon: cfg.icon, editable: FAMILY_EDIT, ...family.payload() };
+}
+
+async function handleFamilyPost(req, res, action) {
+  if (!familyEnabled()) return json(res, 503, { error: "The family page is not available." });
+  if (!FAMILY_EDIT) return json(res, 403, { error: "Editing the family page is switched off." });
+  let body;
+  try {
+    body = JSON.parse(await readBody(req, 32 * 1024));
+  } catch (err) {
+    return json(res, err.status ?? 400, { error: err.message || "Invalid JSON." });
+  }
+  const actor = { id: String(body?.actor ?? ""), pin: String(body?.pin ?? "") };
+  try {
+    switch (action) {
+      case "chore-save":
+        return json(res, 200, { ok: true, chore: family.saveChore(body.chore, actor) });
+      case "chore-delete":
+        family.deleteChore(String(body.id), actor);
+        return json(res, 200, { ok: true });
+      case "chore-claim":
+        return json(res, 200, { ok: true, chore: family.claim(String(body.id), actor.id) });
+      case "chore-done":
+        return json(res, 200, { ok: true, chore: family.done(String(body.id), actor.id) });
+      case "chore-undo":
+        return json(res, 200, { ok: true, chore: family.undo(String(body.id), actor.id) });
+      case "chore-approve":
+        return json(res, 200, { ok: true, chore: family.approve(String(body.id), actor) });
+      case "chore-reject":
+        return json(res, 200, { ok: true, chore: family.reject(String(body.id), body.note, actor) });
+      case "reward-save":
+        return json(res, 200, { ok: true, reward: family.saveReward(body.reward, actor) });
+      case "reward-delete":
+        family.deleteReward(String(body.id), actor);
+        return json(res, 200, { ok: true });
+      case "reward-suggest":
+        return json(res, 200, { ok: true, reward: family.suggest(body.title, actor.id) });
+      case "reward-price":
+        return json(res, 200, { ok: true, reward: family.priceSuggestion(String(body.id), body.cost, body.accept !== false, actor) });
+      case "reward-redeem":
+        return json(res, 200, { ok: true, ...family.redeem(String(body.id), body.person ? String(body.person) : actor.id, actor.id) });
+      case "reward-use":
+        return json(res, 200, { ok: true, ...family.use(String(body.id), body.person ? String(body.person) : actor.id, body.amount, actor.id) });
+      case "adjust":
+        return json(res, 200, { ok: true, ...family.adjust(String(body.person), body.delta, body.reason, actor) });
+      case "ledger-reverse":
+        family.reverse(String(body.id), actor);
+        return json(res, 200, { ok: true });
+      default:
+        return json(res, 404, { error: "Not found." });
+    }
+  } catch (err) {
+    logger.warn(`Family ${action} failed: ${err.message}`);
+    return json(res, err.status ?? 502, { error: err.message });
+  }
+}
+
+// ---- calendar page (month and planner) --------------------------------------------------------------
+
+const CALENDAR_COLORS = ["#38bdf8", "#fb923c", "#a78bfa", "#f472b6", "#4ade80", "#facc15", "#f87171", "#2dd4bf"];
+const calendarPageEnabled = () => Boolean(configStore.current.config?.calendar?.enabled);
+
+/** The calendars of the page with their name, colour and what each may do (create, change, delete). */
+function calendarPageList() {
+  const cfg = configStore.current.config?.calendar;
+  if (!cfg?.enabled) return [];
+  const known = [...ha.entityIndex.keys()].filter((id) => id.startsWith("calendar."));
+  const ids = cfg.entities.length ? cfg.entities : known.sort();
+  const people = familyEnabled() ? familyPeople() : [];
+  return ids.map((id, i) => {
+    const person = people.find((p) => p.calendar === id);
+    const caps = calendarCaps(ha.states.get(id)?.attributes?.supported_features);
+    const none = { create: false, update: false, delete: false };
+    return {
+      id,
+      name: cfg.names[id] ?? person?.name ?? ha.entityIndex.get(id)?.name ?? ha.states.get(id)?.attributes?.friendly_name ?? id,
+      color: cfg.colors[id] ?? person?.color ?? CALENDAR_COLORS[i % CALENDAR_COLORS.length],
+      can: CALENDAR_EDIT ? caps : none,
+    };
+  });
+}
+
+async function handleCalendarView(res, params) {
+  if (!calendarPageEnabled()) return json(res, 404, { error: "The calendar page is not available." });
+  const window = parseWindow(params.get("start"), params.get("end"));
+  if (!window) return json(res, 400, { error: "Invalid time window." });
+  const list = calendarPageList();
+  try {
+    const { events, failed } = await calendars.detailed(list.map((c) => c.id), window, haRest);
+    return json(res, 200, { calendars: list, events, failed, editable: CALENDAR_EDIT });
+  } catch (err) {
+    logger.warn(`Calendar page failed: ${err.message}`);
+    return json(res, 502, { error: err.message });
+  }
+}
+
+async function handleEnergy(res, params) {
+  if (!configStore.current.config?.energy || configStore.current.config.energy.enabled === false) return json(res, 404, { error: "The Energy page is not available." });
+  try {
+    const data = await energy.overview({ date: params.get("date"), period: params.get("period") ?? "day" });
+    return json(res, 200, data);
+  } catch (err) {
+    logger.warn(`Energy page failed: ${err.message}`);
+    return json(res, err.status ?? 502, { error: err.message });
+  }
+}
+
+async function handleCalendarEvent(req, res) {
+  if (!calendarPageEnabled()) return json(res, 404, { error: "The calendar page is not available." });
+  if (!CALENDAR_EDIT) return json(res, 403, { error: "Editing the calendar is switched off." });
+  let body;
+  try {
+    body = JSON.parse(await readBody(req, 16 * 1024));
+  } catch (err) {
+    return json(res, err.status ?? 400, { error: err.message || "Invalid JSON." });
+  }
+  const calendar = calendarPageList().find((c) => c.id === body?.calendar);
+  if (!calendar) return json(res, 404, { error: "Unknown calendar." });
+  const action = String(body?.action ?? "");
+  const need = { create: "create", update: "update", delete: "delete" }[action];
+  if (!need) return json(res, 400, { error: "Unknown action." });
+  if (!calendar.can[need]) return json(res, 403, { error: `The calendar “${calendar.name}” cannot ${need} events.` });
+  const uid = typeof body.uid === "string" ? body.uid.slice(0, 200) : "";
+  if (action !== "create" && !uid) return json(res, 400, { error: "The event has no id." });
+  const target = { entity_id: calendar.id, ...(action === "create" ? {} : { uid, ...(typeof body.recurrence_id === "string" && body.recurrence_id ? { recurrence_id: body.recurrence_id.slice(0, 100), ...(body.range === "future" ? { recurrence_range: "THISANDFUTURE" } : {}) } : {}) }) };
+  try {
+    const event = action === "delete" ? null : buildEventInput(body.event);
+    await ha.request({ type: `calendar/event/${action}`, ...target, ...(event ? { event } : {}) });
+    calendars.clear();
+    return json(res, 200, { ok: true });
+  } catch (err) {
+    logger.warn(`Calendar ${action} failed: ${err.message}`);
+    return json(res, err.status ?? 502, { error: err.message });
+  }
+}
+
+/** Remove a device from an area's overview, or bring it back. */
+async function handleAreaDevice(req, res) {
+  if (READ_ONLY || !AREA_EDIT) return json(res, 403, { error: "Editing the area devices is switched off." });
+  let body;
+  try {
+    body = JSON.parse(await readBody(req));
+  } catch (err) {
+    return json(res, err.status ?? 400, { error: err.message || "Invalid JSON." });
+  }
+  const id = body?.entity_id;
+  const known = areaModel.areas.some((a) => a.entities.includes(id) || a.hidden_entities.includes(id));
+  if (!known || typeof body?.hidden !== "boolean") return json(res, 400, { error: "That device is not on an area page." });
+  if (hiddenDevices.set(id, body.hidden)) {
+    logger.info(`${id} ${body.hidden ? "removed from" : "restored to"} its area page`);
+    rebuild({ refresh: false });
+  }
+  return json(res, 200, { ok: true });
+}
+
+/** Remove a card from the Devices page, or bring it back. */
+async function handleDevicesCard(req, res) {
+  if (READ_ONLY || !AREA_EDIT) return json(res, 403, { error: "Editing the devices is switched off." });
+  let body;
+  try {
+    body = JSON.parse(await readBody(req));
+  } catch (err) {
+    return json(res, err.status ?? 400, { error: err.message || "Invalid JSON." });
+  }
+  if (!devicesState.enabled || !deviceKeys(devicesState).has(body?.key) || typeof body?.hidden !== "boolean") {
+    return json(res, 400, { error: "That device is not on the Devices page." });
+  }
+  if (hiddenDevices.set(body.key, body.hidden, "devices")) {
+    logger.info(`${body.key} ${body.hidden ? "removed from" : "restored to"} the Devices page`);
+    rebuild({ refresh: false });
+  }
+  return json(res, 200, { ok: true });
+}
+
+async function handleCalendar(res, params) {
+  const scope = calendarScope(configStore.current.config, [...ha.entityIndex.keys()]);
+  const window = parseWindow(params.get("start"), params.get("end"));
+  if (!window) return json(res, 400, { error: "Invalid time window." });
+  const asked = params.get("entities");
+  const ids = !asked || asked === "all" ? [...scope.calendars] : asked.split(",").filter((id) => scope.calendars.has(id));
+  const weatherId = params.get("weather");
+  try {
+    const [events, forecast] = await Promise.all([
+      calendars.events(ids, window),
+      weatherId && scope.weather.has(weatherId) ? calendars.forecast(weatherId) : {},
+    ]);
+    const names = Object.fromEntries(ids.map((id) => [id, ha.entityIndex.get(id)?.name ?? ha.states.get(id)?.attributes?.friendly_name ?? id]));
+    return json(res, 200, { calendars: names, events, forecast });
+  } catch (err) {
+    logger.warn(`Calendar request failed: ${err.message}`);
+    return json(res, 502, { error: err.message });
+  }
+}
+
+async function handleMusicGet(res, p, params) {
+  if (!music.configured) return json(res, 503, { error: "Music Assistant address and token are not set in the add-on options." });
+  try {
+    if (p === "/api/music/library") {
+      return json(res, 200, await music.library({
+        tab: params.get("tab"),
+        q: params.get("q"),
+        limit: params.get("limit"),
+        offset: params.get("offset"),
+        sort: params.get("sort"),
+        favorite: params.get("fav") === "1",
+      }));
+    }
+    if (p === "/api/music/discover") return json(res, 200, await music.discover());
+    if (p === "/api/music/party") return json(res, 200, await music.party());
+    if (p === "/api/music/party/qr") {
+      const qr = await music.partyQr();
+      if (!qr) return json(res, 404, { error: "Guest access is switched off in the Party plugin." });
+      res.writeHead(200, { "Content-Type": qr.type, "Content-Length": qr.body.length, "Cache-Control": "no-store" });
+      return res.end(qr.body);
+    }
+    if (p === "/api/music/search") return json(res, 200, await music.search(params.get("q")));
+    if (p === "/api/music/item") {
+      if (!DETAIL_TYPES.has(params.get("type"))) return json(res, 400, { error: "Unknown item type." });
+      return json(res, 200, await music.detail(params.get("type"), params.get("provider"), params.get("id")));
+    }
+    if (p.startsWith("/api/music/image/")) {
+      const image = await music.image(p.slice("/api/music/image/".length));
+      return image ? sendImage(res, image) : json(res, 404, { error: "Unknown image." });
+    }
+    return json(res, 404, { error: "Not found." });
+  } catch (err) {
+    logger.debug(`Music request ${p} failed: ${err.message}`);
+    return json(res, err.status ?? 502, { error: err.message });
+  }
+}
+
+async function handleMusicPlay(req, res) {
+  if (READ_ONLY) return json(res, 403, { error: "The add-on is in read-only mode." });
+  let body;
+  try {
+    body = JSON.parse(await readBody(req));
+  } catch (err) {
+    return json(res, err.status ?? 400, { error: err.message || "Invalid JSON." });
+  }
+  if (typeof body?.entity_id !== "string" || !radioPlayerIds.includes(body.entity_id)) {
+    return json(res, 400, { error: "That is not a Music Assistant player on the music page." });
+  }
+  try {
+    await music.play(body.entity_id, body);
+    logger.debug(`music ${body.uri} -> ${body.entity_id}`);
+    json(res, 200, { ok: true });
+  } catch (err) {
+    logger.warn(`Music playback failed: ${err.message}`);
+    json(res, err.status ?? 502, { error: err.message });
+  }
+}
+
+function handleNowPlayingArt(res, rawId) {
+  let id;
+  try {
+    id = decodeURIComponent(rawId);
+  } catch {
+    return json(res, 400, { error: "Bad id." });
+  }
+  const image = nowPlaying.art(id);
+  return image ? sendImage(res, image) : json(res, 404, { error: "No artwork." });
+}
+
+async function handleRadioImage(res, id) {
+  try {
+    const image = await radio.image(id);
+    if (!image) return json(res, 404, { error: "Unknown station." });
+    sendImage(res, image);
+  } catch (err) {
+    logger.debug(`Radio logo failed: ${err.message}`);
+    json(res, 502, { error: "Logo not available." });
+  }
+}
+
+// ---- server -----------------------------------------------------------------
+
+const server = http.createServer(async (req, res) => {
+  const url = new URL(req.url, "http://localhost");
+  const p = url.pathname;
+  try {
+    if (req.method === "GET" || req.method === "HEAD") {
+      if (p === "/api/events") return handleEvents(req, res);
+      if (p === "/api/config") return json(res, 200, configPayload());
+      if (p === "/api/calendar") return await handleCalendar(res, url.searchParams);
+      if (p === "/api/calendar/view") return await handleCalendarView(res, url.searchParams);
+      if (p === "/api/energy") return await handleEnergy(res, url.searchParams);
+      if (p === "/api/legacy/photos") return await handleLegacyPhotos(res);
+      if (p === "/api/legacy/photo") return await handleLegacyPhoto(req, res, url.searchParams);
+      if (p === "/api/legacy/cameras") return handleLegacyCameras(res);
+      if (p === "/api/legacy/camera") return await handleLegacyCamera(res, url.searchParams.get("entity"));
+      if (p === "/api/meals") return json(res, 200, mealsPayload());
+      if (p === "/api/family") return json(res, 200, familyPayload());
+      if (p === "/api/meals/cookbook") return await handleCookbook(res, url.searchParams);
+      if (p === "/api/todo/items") return await handleTodoGet(res, url.searchParams);
+      if (p.startsWith("/api/plex/")) return await handlePlexGet(res, p, url.searchParams);
+      if (p === "/api/proxy") return await proxyImage(res, url.searchParams.get("path"));
+      if (p.startsWith("/api/nowplaying/art/")) return handleNowPlayingArt(res, p.slice("/api/nowplaying/art/".length));
+      if (p.startsWith("/api/music/")) return await handleMusicGet(res, p, url.searchParams);
+      if (p.startsWith("/api/radio/image/")) return await handleRadioImage(res, p.slice("/api/radio/image/".length));
+      if (p === "/healthz") return json(res, 200, { ok: true, ha: ha.connected });
+      if (p.startsWith("/icons/") && p.endsWith(".svg")) {
+        const svg = iconSvg(p.slice("/icons/".length, -".svg".length));
+        if (!svg) return json(res, 404, { error: "Unknown icon." });
+        res.writeHead(200, { "Content-Type": MIME[".svg"], "Cache-Control": "public, max-age=604800" });
+        return res.end(svg);
+      }
+      if (p.startsWith("/assets/")) {
+        return serveFile(res, path.resolve(configStore.assetsDir), p.slice("/assets/".length), "no-cache");
+      }
+      if (p.startsWith("/api/")) return json(res, 404, { error: "Not found." });
+      if (p === "/" || p === "/legacy") {
+        res.writeHead(302, { Location: "legacy/" });
+        return res.end();
+      }
+      const rel = p === "/legacy/" ? "legacy/index.html" : p.slice(1);
+      const longCache = rel.startsWith("fonts/");
+      return serveFile(res, webRoot, rel, longCache ? "public, max-age=31536000, immutable" : "no-cache");
+    }
+    if (req.method === "POST" && p === "/api/service") return await handleService(req, res);
+    if (req.method === "POST" && p === "/api/plex/play") return await handlePlexPlay(req, res);
+    if (req.method === "POST" && p === "/api/areas/device") return await handleAreaDevice(req, res);
+    if (req.method === "POST" && p === "/api/calendar/event") return await handleCalendarEvent(req, res);
+    if (req.method === "POST" && p.startsWith("/api/family/")) return await handleFamilyPost(req, res, p.slice("/api/family/".length));
+    if (req.method === "POST" && p.startsWith("/api/meals/")) return await handleMealsPost(req, res, p.slice("/api/meals/".length));
+    if (req.method === "POST" && p === "/api/devices/card") return await handleDevicesCard(req, res);
+    if (req.method === "POST" && ["/api/todo/create", "/api/todo/rename", "/api/todo/delete"].includes(p)) return await handleTodoManage(req, res, p.slice("/api/todo/".length));
+    if (req.method === "POST" && p === "/api/radio/play") return await handleRadioPlay(req, res);
+    if (req.method === "POST" && p === "/api/music/play") return await handleMusicPlay(req, res);
+    if (req.method === "POST" && p === "/api/radio/group") return await handleRadioGroup(req, res);
+    json(res, 405, { error: "Method not allowed." });
+  } catch (err) {
+    logger.error(`Unhandled error for ${req.method} ${p}: ${err.stack}`);
+    if (!res.headersSent) json(res, 500, { error: "Internal error." });
+    else res.end();
+  }
+});
+
+const heartbeat = setInterval(() => clients.forEach((res) => res.write(": ping\n\n")), 20_000);
+heartbeat.unref();
+
+configStore.seedIfMissing(path.join(appRoot, "examples", "dashboard.yaml"));
+configStore.watch();
+menuOptionsSync?.update(configStore.current.config);
+rescanImages();
+allowed = new Set(configStore.current.entities);
+ha.setWatched(allowed, { refresh: false });
+ha.start();
+radio.start();
+setInterval(() => ha.connected && energy.refresh(), 60_000).unref();
+setInterval(rescanImages, 3000).unref();
+
+server.listen(PORT, () => logger.info(`Dasher Apple ${version} listening on :${server.address().port} (config: ${configStore.file})`));
+
+for (const sig of ["SIGTERM", "SIGINT"]) {
+  process.on(sig, () => {
+    logger.info(`${sig} received, shutting down`);
+    ha.stop();
+    radio.stop();
+    nowPlaying.stop();
+    clients.forEach((res) => res.end());
+    server.close(() => process.exit(0));
+    setTimeout(() => process.exit(0), 2000).unref();
+  });
+}

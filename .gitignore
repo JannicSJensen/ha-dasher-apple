@@ -1,0 +1,12 @@
+node_modules/
+*.log
+.DS_Store
+
+# local development state (never committed)
+dasher-apple/app/dev/config/
+dasher-apple/app/dev/data/
+dasher-apple/app/dev/live/
+dasher-apple/app/dev/live-config/
+dasher-apple/app/dev/live-data/
+dasher-apple/app/dev/mock-config/
+dasher-apple/app/dev/mock-data/

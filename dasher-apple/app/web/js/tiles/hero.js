@@ -1,0 +1,121 @@
+import { h } from "../core/h.js";
+import { assetUrl } from "../core/api.js";
+import { formatDate, formatNumber, formatTime } from "../lib/format.js";
+import { icon } from "../core/icons.js";
+import { pickFirst } from "../lib/conditions.js";
+import { activeMessages, withVacuumMessages } from "../lib/messages.js";
+import { weatherPresentation } from "../lib/weather.js";
+import { createWeatherScene } from "../components/weather-scene.js";
+import { backgroundImage, createButtonRow } from "./common.js";
+
+/** Large area tile: state-dependent background, clock/date and a row of quick buttons. */
+export function createHeroTile(cfg, ctx) {
+  const layers = [h("div", { class: "hero__img" }), h("div", { class: "hero__img" })];
+  let front = 0;
+  let currentUrl = null;
+
+  const clock = h("div", { class: "hero__clock" });
+  const date = h("div", { class: "hero__date" });
+  const weather = cfg.weather_background ? createWeatherScene() : null;
+  const weatherLabel = h("div", { class: "hero__weather", hidden: !weather });
+  const buttons = createButtonRow(cfg.buttons, ctx, { labels: cfg.button_labels !== false });
+  // With no picture of its own the tile shows a built-in room: dim, and lit while one of `scene_entities` is on.
+  const defaultScene = cfg.scene === false ? null : typeof cfg.scene === "string" ? cfg.scene : cfg.image || cfg.backgrounds?.length ? null : "living";
+  const messages = h("div", { class: `hero__messages${cfg.show_clock === false ? " no-clock" : ""}`, "aria-live": "polite" });
+  let messagesSignature = "";
+
+  const el = h(
+    "div",
+    { class: "tile tile--hero" },
+    layers,
+    weather?.el,
+    h("div", { class: "hero__shade" }),
+    cfg.show_clock === false ? null : h("div", { class: "hero__top" }, clock, date, weatherLabel),
+    cfg.show_clock === false && weather ? h("div", { class: "hero__weather-status" }, weatherLabel) : null,
+    messages,
+    buttons.el,
+  );
+
+  const tickClock = () => {
+    const now = new Date();
+    const fmt = { locale: ctx.locale, hour12: cfg.time_format === "12h" };
+    clock.textContent = formatTime(now, fmt);
+    date.textContent = formatDate(now, fmt);
+  };
+
+  let timer;
+  const schedule = () => {
+    tickClock();
+    timer = setTimeout(schedule, 60_000 - (Date.now() % 60_000) + 50);
+  };
+  schedule();
+  const onVisible = () => {
+    weather?.pause(document.hidden);
+    if (!document.hidden) {
+      clearTimeout(timer);
+      schedule();
+    }
+  };
+  weather?.pause(document.hidden);
+  document.addEventListener("visibilitychange", onVisible);
+
+  const setBackground = (url) => {
+    if (url === currentUrl) return;
+    currentUrl = url;
+    const next = 1 - front;
+    backgroundImage(layers[next], url);
+    layers[next].classList.toggle("is-scene", Boolean(url) && url.includes("img/rooms/"));
+    layers[next].classList.add("is-visible");
+    layers[front].classList.remove("is-visible");
+    front = next;
+  };
+
+  const paintMessages = () => {
+    const configured = withVacuumMessages(cfg);
+    const list = configured.length ? activeMessages(configured, ctx.getState, { t: ctx.t, locale: ctx.locale, vacuums: ctx.vacuums?.() ?? [] }) : [];
+    const signature = JSON.stringify(list);
+    if (signature === messagesSignature) return;
+    messagesSignature = signature;
+    messages.replaceChildren(
+      ...list.map((m) =>
+        h(
+          "div",
+          { class: `heromsg${m.urgent ? " is-urgent" : ""}`, style: m.color ? `--msg:${m.color}` : null },
+          h("div", { class: "heromsg__icon" }, icon(m.icon)),
+          h("div", { class: "heromsg__text" }, h("div", { class: "heromsg__title" }, m.title), m.detail ? h("div", { class: "heromsg__detail" }, m.detail) : null),
+          m.badge ? h("span", { class: "heromsg__badge" }, m.badge) : null,
+        ),
+      ),
+    );
+  };
+  // Pick-ups are counted in days, so the list is also re-checked when midnight passes.
+  const msgTimer = setInterval(paintMessages, 60_000);
+
+  return {
+    el,
+    // the vacuums that may need water, so the tile is updated when one changes
+    get entities() {
+      return withVacuumMessages(cfg).some((m) => m?.kind === "vacuum" && !m.entity) ? (ctx.vacuums?.() ?? []) : [];
+    },
+    update() {
+      paintMessages();
+      if (weather) {
+        const model = weatherPresentation(ctx.getState(cfg.weather_entity), ctx.getState(cfg.sun_entity));
+        weather.set(model);
+        el.classList.toggle("has-weather", Boolean(model.scene));
+        const temperature = model.temperature == null ? "" : ` · ${formatNumber(model.temperature, { locale: ctx.locale, decimals: 1 })}${model.unit}`;
+        weatherLabel.textContent = model.condition ? `${ctx.t(`weather_${model.condition.replaceAll("-", "_")}`)}${temperature}` : ctx.t("hero_weather_unavailable");
+      }
+      const match = pickFirst(cfg.backgrounds, ctx.getState);
+      setBackground(assetUrl(match?.image ?? cfg.image ?? (defaultScene ? `scene:${defaultScene}` : null)));
+      const sources = cfg.scene_entities ?? [];
+      el.classList.toggle("is-lit", !sources.length || sources.some((id) => ctx.getState(id)?.state === "on"));
+      buttons.update();
+    },
+    destroy() {
+      clearTimeout(timer);
+      clearInterval(msgTimer);
+      document.removeEventListener("visibilitychange", onVisible);
+    },
+  };
+}

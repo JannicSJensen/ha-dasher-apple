@@ -1,0 +1,93 @@
+name: Dasher Apple
+version: "0.1.0"
+slug: dasher_apple
+url: https://github.com/JannicSJensen/ha-dasher-apple
+description: Apple-inspired Home Assistant dashboard for older iPads
+arch:
+  - aarch64
+  - amd64
+init: false
+homeassistant_api: true
+hassio_api: true
+ingress: true
+ingress_port: 8100
+ingress_stream: true
+panel_icon: mdi:tablet-dashboard
+panel_title: Dasher Apple
+ports:
+  8100/tcp: 8100
+ports_description:
+  8100/tcp: Apple dashboard web page
+map:
+  - type: app_config
+    read_only: false
+    path: /config
+options:
+  log_level: info
+  read_only: false
+  entity_map: []
+  menu_items: []
+  weather_background: true
+  legacy_faces:
+    - home
+    - home_plus
+    - modular
+    - weather
+    - calendar
+    - clock
+    - analog
+    - flow
+    - photos
+    - cameras
+  legacy_wallpaper: ""
+  legacy_photos: false
+  legacy_photo_albums: []
+  legacy_photo_interval: 120
+  legacy_cameras: false
+  legacy_camera_interval: 30
+  allow_todo_management: true
+  allow_area_editing: true
+  allow_area_picture_upload: true
+  allow_meal_editing: true
+  allow_family_editing: true
+  enable_family: false
+  enable_calendar: false
+  allow_calendar_editing: true
+  family_children: []
+schema:
+  log_level: list(debug|info|warning|error)
+  read_only: bool
+  weather_background: bool
+  legacy_faces:
+    - list(home|home_plus|modular|weather|calendar|clock|analog|flow|photos|cameras)
+  legacy_wallpaper: str
+  legacy_photos: bool
+  legacy_photo_albums:
+    - str
+  legacy_photo_interval: int(10,3600)
+  legacy_cameras: bool
+  legacy_camera_interval: int(10,3600)
+  entity_map:
+    - from: str
+      to: str
+  menu_items:
+    - id: str
+      visibility: list(default|show|hide)?
+      visible: bool?
+      title: str?
+      icon: str?
+      order: int(0,)?
+  allow_todo_management: bool
+  allow_area_editing: bool
+  allow_area_picture_upload: bool
+  allow_meal_editing: bool
+  allow_family_editing: bool
+  enable_family: bool
+  enable_calendar: bool
+  allow_calendar_editing: bool
+  family_children:
+    - str
+  music_assistant_url: url?
+  music_assistant_token: password?
+  plex_url: url?
+  plex_token: password?

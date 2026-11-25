@@ -1,0 +1,865 @@
+/**
+ * Tiny fake Home Assistant for local development and screenshots.
+ *   node dev/mock-ha.js   (listens on :8123)
+ * Implements just enough of the WebSocket API: auth, get_states, subscribe_events,
+ * call_service (mutates state and emits state_changed) and ping.
+ */
+import fs from "node:fs";
+import http from "node:http";
+import { WebSocketServer } from "ws";
+import { MOCK_ENERGY_CONFIG, MOCK_ENERGY_INFO, mockEnergyMetadata, mockEnergyPreferences, mockEnergyStatistics } from "./mock-energy.js";
+import { energyWindow } from "../src/energy-window.js";
+
+const now = new Date();
+const day = new Date(now);
+day.setHours(0, 0, 0, 0);
+const priceDay = energyWindow({ timeZone: MOCK_ENERGY_CONFIG.time_zone, now: now.getTime() });
+const priceStart = Date.parse(priceDay.start);
+const prices = Array.from({ length: (Date.parse(priceDay.end) - priceStart) / 3600_000 }, (_, h) => {
+  const start = new Date(priceStart + h * 3600_000);
+  const value = 0.3 + 0.9 * Math.max(0, Math.sin(((h - 5) / 24) * Math.PI * 2)) + (h >= 17 && h <= 20 ? 1.2 : 0);
+  return { start: start.toISOString(), end: new Date(start.getTime() + 3600_000).toISOString(), value: Number(value.toFixed(3)) };
+});
+
+const states = new Map();
+const put = (entity_id, state, attributes = {}) =>
+  states.set(entity_id, { entity_id, state, attributes, last_changed: new Date().toISOString(), last_updated: new Date().toISOString(), context: {} });
+
+put("light.living_room_lamp", "on", { friendly_name: "Living room lamp", brightness: 180, supported_color_modes: ["brightness"] });
+put("light.garage_spots", "off", { friendly_name: "Garage spots", supported_color_modes: ["onoff"] });
+put("light.carport", "off", { friendly_name: "Carport", supported_color_modes: ["onoff"] });
+put("light.garage_old", "unavailable", { friendly_name: "Old garage lamp" });
+put("input_boolean.good_night", "off", { friendly_name: "Good night" });
+put("input_boolean.vacation", "on", { friendly_name: "Vacation" });
+// waste pick-ups like the RenoWeb sensors: state = days left, plus the date and a bin colour
+const dayLabel = (n) => { const d = new Date(); d.setDate(d.getDate() + n); return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`; };
+put("sensor.waste_general", "1", { friendly_name: "Waste general", description: "240 L Rest/Mad - Beholder (Privat)", next_pickup_date: dayLabel(1), icon: "mdi:trash-can", icon_color: "#FFC108", unit_of_measurement: "dage" });
+put("sensor.waste_paper", "8", { friendly_name: "Waste paper", description: "240 l Pap Egenløsning (Privat)", next_pickup_date: dayLabel(8), icon: "mdi:note", icon_color: "#9E9E9E", unit_of_measurement: "dage" });
+put("sensor.waste_plastic", "0", { friendly_name: "Waste plastic", description: "370 l Plast+MDK/Papir - Egenløsning (Privat)", next_pickup_date: dayLabel(0), icon: "mdi:trash-can", icon_color: "#9E9E9E", unit_of_measurement: "dage" });
+put("sun.sun", "above_horizon", {});
+put("camera.front_door", "idle", { friendly_name: "Front door" });
+// the family
+put("person.mor", "home", { friendly_name: "Mor" });
+put("person.far", "not_home", { friendly_name: "Far" });
+put("person.emil", "home", { friendly_name: "Emil" });
+put("person.ida", "home", { friendly_name: "Ida" });
+// climate helpers (groups per room) and a device thermostat that the climate page leaves out
+const thermostat = (id, name, current, target, state = "heat", extra = {}) =>
+  put(id, state, { friendly_name: name, current_temperature: current, temperature: target, hvac_modes: ["off", "heat"], min_temp: 5, max_temp: 30, target_temp_step: 0.5, supported_features: 1, ...extra });
+thermostat("climate.stue", "stue", 22.1, 20.5, "heat", { hvac_action: "heating", entity_id: ["climate.climate_stue_01"] });
+thermostat("climate.rud", "rud", 23.6, 20, "heat", { hvac_action: "idle" });
+thermostat("climate.hjalte", "hjalte", 21.6, 19);
+thermostat("climate.bryggers", "bryggers", 22.1, 21.5, "off");
+thermostat("climate.bad", "bad", 23.7, 24, "heat", { hvac_modes: ["off"] });
+thermostat("climate.climate_stue_01", "climate-stue-01", 22.1, 22);
+thermostat("climate.old_heater", "Old heater", 18, 20, "unavailable");
+// Plex: two players that can play Plex media (a Cast TV and a Plex client) and one that is offline
+put("media_player.living_room_tv", "idle", { friendly_name: "Living room TV", supported_features: 152127 });
+put("media_player.plex_ipad", "idle", { friendly_name: "Plex (iPad)", supported_features: 152127 });
+put("media_player.stuen_tv", "idle", { friendly_name: "Stuen TV" });
+put("media_player.plex_apple_tv", "unavailable", { friendly_name: "Plex (Apple TV)", restored: true });
+// the car's remote climate (FordPass)
+put("switch.fordpass_x_ignition", "off", { friendly_name: "RC: Start" });
+put("number.fordpass_x_rcctemperature", "22.0", { friendly_name: "RC: Temperature", min: 15.5, max: 30.5, step: 0.5, mode: "box", unit_of_measurement: "°C" });
+put("switch.fordpass_x_rccdefrostfront", "off", { friendly_name: "RC: Front" });
+put("switch.fordpass_x_rccdefrostrear", "off", { friendly_name: "RC: Rear" });
+// vacuums and LG ThinQ-like appliances (washer running, dishwasher idle, dryer offline)
+put("vacuum.robbie", "paused", { friendly_name: "Robbie   Robbie ", clean_water_tank_status: "Low water", dirty_water_tank_status: "Installed", error: "Water tank dry", faults: { 107: "Water tank dry" }, supported_features: 31676, battery_level: 80, fan_speed: "standard", fan_speed_list: ["silent", "standard", "strong", "turbo"] });
+put("vacuum.overlord", "cleaning", { friendly_name: "Overlord", supported_features: 31676, battery_level: 54, fan_speed: "strong", fan_speed_list: ["silent", "standard", "strong", "turbo"] });
+put("vacuum.roborock_old", "unavailable", { friendly_name: "roborock.vacuum.s5" });
+const appliance = (slug, status, extra = {}) => {
+  put(`sensor.${slug}_current_status`, status, { options: ["running", "end", "power_off", "pause", "spinning"], device_class: "enum", friendly_name: `${slug} status` });
+  put(`sensor.${slug}_remaining_time`, extra.remaining ?? "unknown", { device_class: "timestamp", friendly_name: `${slug} remaining` });
+  put(`switch.${slug}_power`, extra.power ?? "on", { friendly_name: `${slug} power` });
+  put(`select.${slug}_operation`, "unknown", { options: ["start", "stop", "power_off", "wake_up"], friendly_name: `${slug} operation` });
+  put(`number.${slug}_delay_ends_in`, "0", { min: 0, max: 19, step: 1, unit_of_measurement: "h", friendly_name: `${slug} delay` });
+};
+appliance("vaskemaskine", "running", { remaining: new Date(Date.now() + 47 * 60_000).toISOString() });
+appliance("opvaskemaskine", "end", { power: "on" });
+appliance("torretumbler", "unavailable", { power: "unavailable" });
+// to-do lists: a shopping list, a Local To-do list and a CalDAV list, with items
+const todoItems = new Map();
+const todoFeatures = { shopping_list: 15, local_todo: 127, caldav: 119 };
+const todoMeta = new Map(); // entity id -> { platform, entry }
+let todoUid = 100;
+function todoCreate(entityId, name, platform, items = []) {
+  todoItems.set(entityId, items.map((i) => ({ uid: String(++todoUid), status: "needs_action", ...i })));
+  todoMeta.set(entityId, { platform, entry: `entry-${entityId.slice(5)}` });
+  put(entityId, "0", { friendly_name: name, supported_features: todoFeatures[platform] });
+  todoCount(entityId);
+}
+function todoCount(entityId) {
+  const open = todoItems.get(entityId).filter((i) => i.status === "needs_action").length;
+  const s = states.get(entityId);
+  states.set(entityId, { ...s, state: String(open), last_changed: new Date().toISOString() });
+}
+todoCreate("todo.indkobsliste", "Indkøbsliste", "shopping_list", [{ summary: "Mælk" }, { summary: "Brød" }, { summary: "Æg", status: "completed" }]);
+todoCreate("todo.garage_chores", "Garage chores", "local_todo", [{ summary: "Clean the workbench", description: "Before the weekend", due: dayLabel(2) }, { summary: "Buy oil", due: dayLabel(-1) }]);
+todoCreate("todo.family", "Family ⚠️", "caldav", [{ summary: "Book the dentist" }]);
+// meal plan: an AI Task entity, a shopping list and a writable calendar
+put("ai_task.mock_ai", "unknown", { friendly_name: "Mock AI Task" });
+put("calendar.madplan", "off", { friendly_name: "Madplan" });
+const mealEvents = []; // { uid, calendar, summary, description, start, end }
+put("calendar.family", "off", { friendly_name: "Family", supported_features: 7 });
+put("calendar.privat", "off", { friendly_name: "Privat", supported_features: 7 });
+put("calendar.skole", "off", { friendly_name: "Skole", supported_features: 0 });
+put("weather.forecast_home", "cloudy", { friendly_name: "Forecast Home", temperature: 11, temperature_unit: "°C" });
+const TIMES = ["None", ...Array.from({ length: 96 }, (_, i) => `${String(Math.floor(i / 4)).padStart(2, "0")}:${String((i % 4) * 15).padStart(2, "0")}`)];
+put("sensor.ev_smart_charging_status", "waiting_for_charging_to_begin", { friendly_name: "EV Smart Charging Status" });
+put("sensor.ev_smart_charging_charging", "off", { friendly_name: "EV Smart Charging Lading", ev_soc: "67.0", ev_target_soc: "80.0", charging_is_planned: true, charging_number_of_hours: 3.5, charging_start_time: new Date(day.getTime() + 25 * 3600_000).toISOString(), charging_stop_time: new Date(day.getTime() + 28.5 * 3600_000).toISOString() });
+put("switch.ev_smart_charging_smart_charging_activated", "on", { friendly_name: "Smart ladning aktiveret" });
+put("switch.ev_smart_charging_ev_connected", "on", { friendly_name: "Elbil tilkoblet" });
+put("select.ev_smart_charging_charge_start_time", "None", { friendly_name: "Starttidspunkt", options: TIMES });
+put("select.ev_smart_charging_charge_completion_time", "08:00", { friendly_name: "Sluttidspunkt", options: TIMES });
+put("button.ev_smart_charging_manually_start_charging", "unknown", { friendly_name: "Start opladning manuelt" });
+put("button.ev_smart_charging_manually_stop_charging", "unknown", { friendly_name: "Stop opladning manuelt" });
+put("switch.peblar_ev_charger_charge", "off", { friendly_name: "Peblar EV Charger Charge" });
+put("button.peblar_ev_charger_restart", "unknown", { friendly_name: "Peblar EV Charger Genstart", device_class: "restart" });
+put("sensor.living_room_temperature", "21.4", { friendly_name: "Living room temperature", device_class: "temperature", unit_of_measurement: "°C" });
+put("binary_sensor.garage_door", "off", { friendly_name: "Garage door", device_class: "door" });
+put("scene.cozy", "unknown", {});
+put("scene.movie", "unknown", {});
+put("sensor.electricity_price", String(prices.find((slot) => now >= new Date(slot.start) && now < new Date(slot.end)).value), { friendly_name: "Electricity price", raw_today: prices, unit_of_measurement: "DKK/kWh", currency: "DKK" });
+put("media_player.living_room", "playing", { friendly_name: "Bose", media_title: "Rix FM Fresh", source: "Radio", volume_level: 0.3, mass_player_type: "player" });
+put("media_player.garage_speaker", "idle", { friendly_name: "Garage speaker", volume_level: 0.15, mass_player_type: "player" });
+put("sensor.car_range", "692", { friendly_name: "Volvo", unit_of_measurement: "km" });
+put("sensor.car_battery", "56", { unit_of_measurement: "%" });
+put("sensor.car_charging_state", "charging", {});
+put("sensor.car_fuel_level", "98", { unit_of_measurement: "%" });
+put("climate.heat_pump", "heat_cool", {
+  friendly_name: "Heat pump",
+  current_temperature: 19,
+  temperature: 22,
+  min_temp: 10,
+  max_temp: 25,
+  target_temp_step: 0.5,
+  hvac_modes: ["off", "heat", "cool", "heat_cool"],
+  fan_modes: ["auto", "low", "high"],
+  fan_mode: "auto",
+  swing_modes: ["off", "vertical"],
+  swing_mode: "off",
+});
+
+// MOCK_STATES=<file.json> replaces the demo entities with a recorded snapshot (array of state objects).
+if (process.env.MOCK_STATES) {
+  states.clear();
+  for (const s of JSON.parse(fs.readFileSync(process.env.MOCK_STATES, "utf8"))) put(s.entity_id, s.state, s.attributes);
+}
+for (const [id, s] of states) {
+  if (s.attributes.mass_player_type === "player") s.attributes = { group_members: [], ...s.attributes, supported_features: 8320575 };
+  if (s.state === "playing" && s.attributes.mass_player_type === "player") {
+    Object.assign(s.attributes, { entity_picture: `/api/media_player_proxy/${id}?token=mock`, media_duration: 175, media_position: 20, media_position_updated_at: new Date().toISOString() });
+  }
+}
+
+// Area/entity registries. MOCK_REGISTRY=<file.json> ({areas, floors, devices, entities}) replaces the demo data.
+let registry = {
+  areas: [
+    { area_id: "living_room", name: "Living room", floor_id: "ground", icon: null, picture: null },
+    { area_id: "garage", name: "Garage", floor_id: "ground", icon: "mdi:garage", picture: null },
+    { area_id: "bedroom", name: "Bedroom", floor_id: "upstairs", icon: null, picture: null },
+  ],
+  floors: [
+    { floor_id: "ground", name: "Ground floor", level: 0 },
+    { floor_id: "upstairs", name: "Upstairs", level: 1 },
+  ],
+  devices: [
+    { id: "dev-wash", name: "Vaskemaskine" },
+    { id: "dev-dish", name: "Opvaskemaskine" },
+    { id: "dev-dry", name: "Tørretumbler" },
+  ],
+  entities: [
+    { ei: "light.living_room_lamp", ai: "living_room" },
+    { ei: "media_player.living_room", ai: "living_room", pl: "music_assistant" },
+    { ei: "media_player.garage_speaker", ai: "garage", pl: "music_assistant" },
+    { ei: "sensor.living_room_temperature", ai: "living_room" },
+    { ei: "light.garage_spots", ai: "garage" },
+    { ei: "light.carport", ai: "garage" },
+    { ei: "binary_sensor.garage_door", ai: "garage" },
+    { ei: "climate.stue", ai: "living_room", pl: "climate_group_helper" },
+    { ei: "climate.rud", pl: "climate_group_helper" },
+    { ei: "climate.hjalte", pl: "climate_group_helper" },
+    { ei: "climate.bryggers", ai: "garage", pl: "climate_group_helper" },
+    { ei: "light.garage_old", ai: "garage" },
+    { ei: "climate.old_heater", ai: "garage", pl: "esphome" },
+    { ei: "climate.bad", pl: "climate_group_helper" },
+    { ei: "climate.climate_stue_01", ai: "living_room", pl: "zwave_js" },
+    { ei: "media_player.living_room_tv", pl: "cast" },
+    { ei: "media_player.plex_ipad", pl: "plex" },
+    { ei: "media_player.stuen_tv", pl: "apple_tv" },
+    { ei: "media_player.plex_apple_tv", pl: "plex" },
+    { ei: "switch.fordpass_x_ignition", pl: "fordpass", tk: "ignition" },
+    { ei: "number.fordpass_x_rcctemperature", pl: "fordpass", tk: "rcctemperature" },
+    { ei: "switch.fordpass_x_rccdefrostfront", pl: "fordpass", tk: "rccdefrostfront" },
+    { ei: "switch.fordpass_x_rccdefrostrear", pl: "fordpass", tk: "rccdefrostrear" },
+    { ei: "sensor.vaskemaskine_current_status", di: "dev-wash", pl: "lg_thinq", tk: "current_state" },
+    { ei: "sensor.vaskemaskine_remaining_time", di: "dev-wash", pl: "lg_thinq", tk: "remaining_time" },
+    { ei: "switch.vaskemaskine_power", di: "dev-wash", pl: "lg_thinq", tk: "operation_power" },
+    { ei: "select.vaskemaskine_operation", di: "dev-wash", pl: "lg_thinq", tk: "operation_mode" },
+    { ei: "number.vaskemaskine_delay_ends_in", di: "dev-wash", pl: "lg_thinq", tk: "delay_ends_in" },
+    { ei: "sensor.opvaskemaskine_current_status", di: "dev-dish", pl: "lg_thinq", tk: "current_state" },
+    { ei: "sensor.opvaskemaskine_remaining_time", di: "dev-dish", pl: "lg_thinq", tk: "remaining_time" },
+    { ei: "switch.opvaskemaskine_power", di: "dev-dish", pl: "lg_thinq", tk: "operation_power" },
+    { ei: "select.opvaskemaskine_operation", di: "dev-dish", pl: "lg_thinq", tk: "operation_mode" },
+    { ei: "number.opvaskemaskine_delay_ends_in", di: "dev-dish", pl: "lg_thinq", tk: "delay_ends_in" },
+    { ei: "sensor.torretumbler_current_status", di: "dev-dry", pl: "lg_thinq", tk: "current_state" },
+    { ei: "sensor.torretumbler_remaining_time", di: "dev-dry", pl: "lg_thinq", tk: "remaining_time" },
+    { ei: "switch.torretumbler_power", di: "dev-dry", pl: "lg_thinq", tk: "operation_power" },
+    { ei: "select.torretumbler_operation", di: "dev-dry", pl: "lg_thinq", tk: "operation_mode" },
+    { ei: "number.torretumbler_delay_ends_in", di: "dev-dry", pl: "lg_thinq", tk: "delay_ends_in" },
+    { ei: "vacuum.robbie", pl: "dreame_vacuum" },
+    { ei: "vacuum.overlord", pl: "dreame_vacuum" },
+    { ei: "vacuum.roborock_old", pl: "roborock" },
+    { ei: "todo.indkobsliste", pl: "shopping_list" },
+    { ei: "todo.garage_chores", pl: "local_todo" },
+    { ei: "todo.family", pl: "caldav" },
+    { ei: "ai_task.mock_ai", pl: "mock_ai" },
+    { ei: "calendar.madplan", pl: "local_calendar" },
+    { ei: "calendar.family" },
+    { ei: "calendar.privat" },
+    { ei: "calendar.skole" },
+    { ei: "weather.forecast_home" },
+    // car charging (EV Smart Charging and a Peblar charger), recognised by integration and translation key
+    { ei: "sensor.ev_smart_charging_status", pl: "ev_smart_charging", tk: "status" },
+    { ei: "sensor.ev_smart_charging_charging", pl: "ev_smart_charging", tk: "charging" },
+    { ei: "switch.ev_smart_charging_smart_charging_activated", pl: "ev_smart_charging", tk: "smart_charging_activated" },
+    { ei: "switch.ev_smart_charging_ev_connected", pl: "ev_smart_charging", tk: "ev_connected" },
+    { ei: "select.ev_smart_charging_charge_start_time", pl: "ev_smart_charging", tk: "charge_start_time", ec: 1 },
+    { ei: "select.ev_smart_charging_charge_completion_time", pl: "ev_smart_charging", tk: "charge_completion_time", ec: 1 },
+    { ei: "button.ev_smart_charging_manually_start_charging", pl: "ev_smart_charging", tk: "manually_start_charging" },
+    { ei: "button.ev_smart_charging_manually_stop_charging", pl: "ev_smart_charging", tk: "manually_stop_charging" },
+    { ei: "switch.peblar_ev_charger_charge", pl: "peblar", tk: "charge", ec: 1 },
+    { ei: "button.peblar_ev_charger_restart", pl: "peblar", ec: 1 },
+  ],
+};
+if (process.env.MOCK_REGISTRY) registry = JSON.parse(fs.readFileSync(process.env.MOCK_REGISTRY, "utf8"));
+
+// Calendar events and a daily forecast relative to today, in the same shapes Home Assistant returns.
+const isoLocal = (d) => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+const atDay = (offset, h, m = 0) => {
+  const d = new Date();
+  d.setDate(d.getDate() + offset);
+  d.setHours(h, m, 0, 0);
+  return d;
+};
+function calendarEvents(id) {
+  const timed = (summary, offset, [h1, m1], [h2, m2]) => ({ summary, start: atDay(offset, h1, m1).toISOString(), end: atDay(offset, h2, m2).toISOString(), description: null, location: null });
+  const allDay = (summary, from, to) => ({ summary, start: isoLocal(atDay(from, 0)), end: isoLocal(atDay(to, 0)), description: null, location: null });
+  if (id === "calendar.family") {
+    return [
+      allDay("Have i gave hos mormor og morfar", -1, 1),
+      timed("Already over today", 0, [6, 0], [7, 0]),
+      timed("Arbejdstid", 1, [9, 45], [16, 0]),
+      timed("Kat arbejde Holbæk", 2, [9, 0], [18, 15]),
+      timed("Arbejdstid", 2, [9, 45], [16, 0]),
+      timed("Arbejdstid", 3, [12, 0], [19, 15]),
+    ];
+  }
+  return [timed("Tandlæge", 3, [14, 30], [15, 15]), allDay("Ferie", 5, 8)];
+}
+// Events of the calendar page: a month of things to do, kept in memory so they can be created, changed and deleted.
+const pageEvents = []; // { uid, calendar, summary, allDay, start, end, description, location, rrule }
+{
+  const day = (offset, h = 0, m = 0) => { const d = atDay(offset, h, m); return d; };
+  const timed = (calendar, summary, offset, [h1, m1], [h2, m2], extra = {}) => pageEvents.push({ uid: `seed${pageEvents.length}`, calendar, summary, allDay: false, start: day(offset, h1, m1), end: day(offset, h2, m2), ...extra });
+  const whole = (calendar, summary, from, to, extra = {}) => pageEvents.push({ uid: `seed${pageEvents.length}`, calendar, summary, allDay: true, start: day(from), end: day(to), ...extra });
+  const weekStart = -((new Date().getDay() + 6) % 7); // this week's Monday, as an offset from today
+  for (let w = -3; w <= 4; w++) {
+    const m = weekStart + w * 7;
+    timed("calendar.family", "Pizza-aften", m + 4, [18, 0], [20, 0]);
+    timed("calendar.family", "Skraldespand", m + 1, [7, 0], [7, 30]);
+    timed("calendar.privat", "Træning", m + 0, [17, 0], [18, 30], { description: "Husk tasken" });
+    timed("calendar.privat", "Træning", m + 3, [17, 0], [18, 30]);
+    timed("calendar.skole", "Skole", m + 0, [8, 0], [14, 0]);
+    timed("calendar.skole", "Skole", m + 1, [8, 0], [14, 0]);
+    timed("calendar.skole", "Skole", m + 2, [8, 0], [13, 0]);
+    timed("calendar.skole", "Fodbold", m + 2, [16, 0], [17, 30]);
+  }
+  whole("calendar.family", "Efterårsferie hos mormor", weekStart + 5, weekStart + 7, { location: "Odense", description: "Pak varmt tøj" });
+  timed("calendar.privat", "Tandlæge", weekStart + 2, [14, 30], [15, 15], { location: "Tandlægen, Storegade 4" });
+  timed("calendar.family", "Forældremøde", weekStart + 2, [19, 0], [20, 30]);
+  timed("calendar.skole", "Svømning", weekStart + 3, [15, 0], [16, 0]);
+  timed("calendar.family", "Fødselsdag: Ida", weekStart + 10, [15, 0], [18, 0], { rrule: "FREQ=YEARLY" });
+}
+const restEvent = (e) => ({ start: e.allDay ? { date: isoLocal(e.start) } : { dateTime: e.start.toISOString() }, end: e.allDay ? { date: isoLocal(e.end) } : { dateTime: e.end.toISOString() }, summary: e.summary, description: e.description ?? null, location: e.location ?? null, uid: e.uid, ...(e.rrule ? { rrule: e.rrule } : {}) });
+const parseMockWhen = (text) => (/^\d{4}-\d{2}-\d{2}$/.test(text) ? new Date(`${text}T00:00:00`) : new Date(text));
+function applyPageEvent(calendar, event, base = {}) {
+  const allDay = /^\d{4}-\d{2}-\d{2}$/.test(event.dtstart);
+  return { ...base, calendar, summary: event.summary, allDay, start: parseMockWhen(event.dtstart), end: parseMockWhen(event.dtend), description: event.description ?? null, location: event.location ?? null, rrule: event.rrule ?? null };
+}
+function forecastDays() {
+  const conditions = ["cloudy", "partlycloudy", "rainy", "sunny", "lightning-rainy", "snowy", "fog"];
+  return Array.from({ length: 7 }, (_, i) => ({ datetime: atDay(i, 12).toISOString().replace(/^.{10}/, isoLocal(atDay(i, 12))), temperature: 11 + (i % 3) * 2, condition: conditions[i % conditions.length] }));
+}
+
+// Plex library as Home Assistant's Plex integration exposes it through media browsing.
+const SRV = "abc123def456";
+const plexUri = (key, resume) => `plex://${SRV}/${key}${resume ? "?resume=1" : ""}`;
+const PLEX_TITLES = {};
+const plexItem = (key, type, title, { resume = false, expand = false } = {}) => {
+  PLEX_TITLES[key] = title;
+  return { title, media_class: type, media_content_id: plexUri(key, resume), media_content_type: type, can_play: true, can_expand: expand, thumbnail: `/api/plex_image_proxy/${SRV}/${key}` };
+};
+const PLEX_HUBS = {
+  "home.continue": ["Continue Watching", () => [
+    plexItem(2001, "episode", "Lanterns - S01E01 - Pilot", { resume: true }),
+    plexItem(2002, "movie", "Rage of Stars (2026)", { resume: true }),
+    plexItem(2003, "episode", "The Mandalorian - S03E08 - The Return", { resume: true }),
+  ]],
+  "home.movies.recent": ["Recently Added Movies", () => [
+    plexItem(3001, "movie", "Speed 2: Cruise Control (1997)"),
+    plexItem(3002, "movie", "Mutiny (2026)"),
+    plexItem(3003, "movie", "Iron Man 2 (2010)"),
+    plexItem(3004, "movie", "The Fix (2026)"),
+  ]],
+  "home.television.recent": ["Recently Added TV", () => [
+    plexItem(1001, "show", "The Boys", { expand: true }),
+    plexItem(1002, "show", "Slow Horses", { expand: true }),
+    plexItem(2004, "episode", "Slow Horses - S06E04 - Lost & Found"),
+  ]],
+  "home.music.recent": ["Recently Added Music", () => [plexItem(4001, "album", "Some Album - Greatest Hits")]],
+  "home.recommended": ["Recommended For You", () => [plexItem(3005, "movie", "Something Else (2020)")]],
+};
+function plexBrowse({ entity_id, media_content_type, media_content_id }) {
+  const e = states.get(entity_id);
+  if (!e || e.state === "unavailable") throw new Error("Entity not available");
+  const isCast = entity_id.includes("living_room_tv");
+  const server = () => ({
+    title: "Bryggers", media_class: "directory", media_content_id: plexUri("server"), media_content_type: "server", can_play: false, can_expand: true,
+    children: [
+      { title: "Recommended (Bryggers)", media_class: "directory", media_content_id: plexUri("server/Recommended"), media_content_type: "server", can_play: false, can_expand: true },
+      { title: "Movies", media_class: "directory", media_content_id: plexUri("1"), media_content_type: "library", can_play: false, can_expand: true },
+    ],
+  });
+  if (!media_content_type) return isCast ? { title: "Cast", media_class: "directory", media_content_id: "", media_content_type: "app", children: [{ title: "Plex", media_class: "app", media_content_id: "", media_content_type: "plex", can_play: false, can_expand: true }] } : server();
+  if (media_content_type === "plex") return server();
+  if (media_content_type === "server") {
+    return { title: "Bryggers", media_class: "directory", media_content_id: media_content_id, media_content_type: "server", can_expand: true,
+      children: Object.entries(PLEX_HUBS).map(([id, [title]]) => ({ title, media_class: "directory", media_content_id: plexUri(`server/${id}`), media_content_type: "hub", can_play: false, can_expand: true })) };
+  }
+  if (media_content_type === "hub") {
+    const id = media_content_id.split("/").pop();
+    if (!PLEX_HUBS[id]) throw new Error("Hub not found");
+    return { title: PLEX_HUBS[id][0], media_class: "directory", media_content_id, media_content_type: "hub", can_expand: true, children: PLEX_HUBS[id][1]() };
+  }
+  if (media_content_type === "show") {
+    const key = Number(media_content_id.split("/").pop().split("?")[0]);
+    return { title: PLEX_TITLES[key] ?? "Show", media_class: "tv_show", media_content_id, media_content_type: "show", can_expand: true,
+      children: [1, 2].map((n) => plexItem(key * 10 + n, "season", `Season ${n}`, { expand: true })) };
+  }
+  if (media_content_type === "season") {
+    const key = Number(media_content_id.split("/").pop().split("?")[0]);
+    return { title: `${PLEX_TITLES[Math.floor(key / 10)] ?? "Show"} - Season ${key % 10}`, media_class: "season", media_content_id, media_content_type: "season", can_expand: true,
+      children: [1, 2, 3].map((n) => plexItem(key * 100 + n, "episode", `S0${key % 10}E0${n} - Episode ${n}`)) };
+  }
+  throw new Error("Media not found");
+}
+const plexPoster = (key) => {
+  const hue = (Number(key) * 47) % 360;
+  const label = String(PLEX_TITLES[key] ?? "Plex").replace(/&/g, "&amp;").replace(/</g, "&lt;").slice(0, 24);
+  const wide = [2001, 2003, 2004].includes(Number(key));
+  const [w, h] = wide ? [320, 180] : [200, 300];
+  return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${w} ${h}"><rect width="${w}" height="${h}" fill="hsl(${hue} 45% 32%)"/><text x="${w / 2}" y="${h / 2}" font-family="Arial,sans-serif" font-weight="700" font-size="20" fill="#fff" text-anchor="middle">${label}</text></svg>`;
+};
+
+// A tiny AI for the meal plan: it answers the three kinds of prompt the app sends, with a few rule-friendly dishes.
+const DISHES = [
+  ["Pasta med kødsovs", "Hakket oksekød", "okse", false, 35], ["Bagt laks med kartofler", "Laks", "laks", false, 40], ["Linsesuppe med brød", "Linser", "linser", true, 30],
+  ["Kylling i karry", "Kylling", "kylling", false, 35], ["Grøntsagslasagne", "Squash", "squash", true, 55], ["Frikadeller med kartofler", "Svinekød", "svin", false, 45],
+  ["Wokret tofu med nudler", "Tofu", "tofu", true, 25], ["Fiskefrikadeller med remoulade", "Torsk", "torsk", false, 30], ["Tacos med bønner", "Bønner", "bønner", true, 25],
+  ["Boller i karry", "Kalkun", "kalkun", false, 40], ["Risotto med svampe", "Svampe", "svampe", true, 40], ["Pizza med skinke", "Skinke", "skinke", false, 30],
+];
+// Mealie recipes as the mealie.* actions return them (dataclass fields).
+const ing = (quantity, unit, food, note = "") => ({ quantity, unit: unit ? { name: unit, abbreviation: unit } : null, food: food ? { name: food, plural_name: null } : null, note, display: `${quantity ?? ""} ${unit ?? ""} ${food ?? note}`.trim(), original_text: null });
+const MEALIE = [
+  { slug: "spaghetti-carbonara", name: "Spaghetti carbonara", description: "Klassisk romersk pasta med æg og bacon.", recipe_servings: 2, total_time_seconds: 1800, tags: [{ name: "Pasta" }, { name: "Hverdag" }], categories: [], rating: 5,
+    ingredients: [ing(200, "g", "Spaghetti"), ing(100, "g", "Bacon"), ing(2, null, "Æg"), ing(50, "g", "Parmesan"), ing(1, "tsk", "Salt"), ing(null, null, null, "Friskkværnet peber")],
+    instructions: [{ title: "", text: "Kog spaghetti i letsaltet vand i 10 minutter." }, { title: "", text: "Steg baconen sprød og rør æg og parmesan sammen." }, { title: "Server", text: "Bland det hele og server straks." }] },
+  { slug: "linsesuppe", name: "Linsesuppe", description: "Mættende vegetarsuppe.", recipe_servings: 4, total_time_seconds: 2400, tags: [{ name: "Vegetar" }], categories: [], rating: 4,
+    ingredients: [ing(300, "g", "Røde linser"), ing(1, null, "Løg"), ing(2, "fed", "Hvidløg"), ing(1, "l", "Grøntsagsbouillon"), ing(2, "spsk", "Olie")],
+    instructions: [{ title: "", text: "Svits løg og hvidløg i olie." }, { title: "", text: "Tilsæt linser og bouillon og kog i 20 minutter." }] },
+  { slug: "frikadeller", name: "Frikadeller", description: "Danske frikadeller.", recipe_servings: 4, total_time_seconds: 3000, tags: [{ name: "Klassiker" }], categories: [], rating: 4,
+    ingredients: [ing(500, "g", "Hakket svinekød"), ing(1, null, "Løg"), ing(1, null, "Æg"), ing(1, "dl", "Mælk"), ing(1, "tsk", "Salt"), ing(50, "g", "Smør")],
+    instructions: [{ title: "", text: "Rør farsen sammen med løg, æg og mælk." }, { title: "", text: "Steg frikadellerne i smør i 15 minutter." }] },
+  { slug: "tomatsuppe", name: "Tomatsuppe med brød", description: "", recipe_servings: 4, total_time_seconds: 1500, tags: [{ name: "Vegetar" }, { name: "Suppe" }], categories: [], rating: 3,
+    ingredients: [ing(800, "g", "Flåede tomater"), ing(1, null, "Løg"), ing(1, "dl", "Fløde")], instructions: [{ title: "", text: "Kog tomater og løg i 15 minutter og blend." }] },
+  { slug: "boeuf-bourguignon", name: "Boeuf bourguignon", description: "Langtidsstegt oksekød i rødvin.", recipe_servings: 6, total_time_seconds: 10800, tags: [{ name: "Weekend" }], categories: [], rating: 5,
+    ingredients: [ing(1, "kg", "Oksekød"), ing(3, "dl", "Rødvin"), ing(2, null, "Gulerødder")], instructions: [{ title: "", text: "Brun kødet og lad det simre i 2 timer." }] },
+];
+const mockMealie = (msg) => {
+  const d = msg.service_data ?? {};
+  if (msg.service === "get_recipes") {
+    const q = String(d.search_terms ?? "").toLowerCase();
+    const items = MEALIE.filter((r) => !q || r.name.toLowerCase().includes(q)).slice(0, d.result_limit ?? 10).map(({ ingredients, instructions, ...rest }) => rest);
+    return { recipes: { items, page: 1, per_page: items.length, total: items.length, total_pages: 1 } };
+  }
+  if (msg.service === "get_recipe") {
+    const r = MEALIE.find((x) => x.slug === d.recipe_id || x.name === d.recipe_id);
+    return r ? { recipe: r } : null;
+  }
+  if (msg.service === "import_recipe") {
+    if (!/^https?:\/\//.test(String(d.url))) return null;
+    const slug = "importeret-" + String(d.url).replace(/[^a-z0-9]+/gi, "-").slice(-24).toLowerCase();
+    MEALIE.unshift({ slug, name: "Importeret opskrift", description: String(d.url), recipe_servings: 4, total_time_seconds: 1200, tags: [], categories: [], rating: 0, ingredients: [ing(500, "g", "Kylling")], instructions: [{ title: "", text: "Steg kyllingen." }] });
+    return { recipe: MEALIE[0] };
+  }
+  return null;
+};
+let dishCursor = 0;
+function mockAi(prompt) {
+  const task = /^\[dasher:(\w+)\]/.exec(prompt)?.[1];
+  if (task === "plan") {
+    const dates = [...prompt.matchAll(/(\d{4}-\d{2}-\d{2}) \(\w{3}\)/g)].map((m) => m[1]);
+    const skip = (/Do NOT plan a dinner for: ([\d, -]+)/.exec(prompt)?.[1] ?? "").split(",").map((x) => x.trim());
+    const days = dates.filter((d) => !skip.includes(d)).map((date) => {
+      const [title, , main, vegetarian, minutes] = DISHES[dishCursor++ % DISHES.length];
+      const own = /recipe collection/.test(prompt) && dishCursor % 2 === 0 ? MEALIE[dishCursor % MEALIE.length] : null;
+      if (own) return { date, kind: "dinner", title: own.name, description: own.description, minutes: 30, vegetarian: false, double_portion: false, main_ingredient: own.slug.split("-")[0], from: null, mealie_slug: own.slug };
+      return { date, kind: "dinner", title, description: `${title}, en god hverdagsret.`, minutes, vegetarian, double_portion: false, main_ingredient: main, from: null, ...(/recipe collection/.test(prompt) ? { mealie_slug: null } : {}) };
+    });
+    return "Here is the plan:\n```json\n" + JSON.stringify({ days }) + "\n```";
+  }
+  if (task === "recipe") {
+    const title = /for the dinner "([^"]+)"/.exec(prompt)?.[1] ?? "Aftensmad";
+    return JSON.stringify({ servings: 4, minutes: 35, vegetarian: false, ingredients: [{ name: "Hovedingrediens til " + title, amount: "500 g" }, { name: "Løg", amount: "2 stk" }, { name: "Hvidløg", amount: "2 fed" }, { name: "Salt", amount: "1 tsk", basic: true }, { name: "Olie", amount: "2 spsk", basic: true }], steps: ["Forbered alle ingredienserne.", "Steg løg og hvidløg i olie i 5 minutter.", "Tilsæt hovedingrediensen og lad det simre i 20 minutter.", "Smag til med salt og server."], tip: "Server med frisk salat." });
+  }
+  if (task === "alternatives") {
+    const picks = [DISHES[(dishCursor += 3) % DISHES.length], DISHES[(dishCursor += 2) % DISHES.length], DISHES[(dishCursor += 5) % DISHES.length]];
+    return JSON.stringify({ alternatives: picks.map(([title, , main, vegetarian, minutes]) => ({ title, description: `${title} som alternativ.`, minutes, vegetarian, main_ingredient: main })) });
+  }
+  return "{}";
+}
+
+// Music Assistant: radio stations (logos are served by this mock at /imageproxy).
+const STATIONS = [
+  ["DR P1", "#ff6a13", "P1"], ["DR P3", "#8fa5a0", "P3"], ["DR P4 København", "#ffa400", "P4"], ["DR P4 Sjælland", "#ffa400", "P4"],
+  ["DR P6 Beat", "#4a4650", "P6"], ["DR P8 Jazz", "#6d2b8f", "P8"], ["myROCK", "#1c1c1c", "ROCK"], ["NOVA", "#1f4260", "NOVA"],
+  ["Pop FM", "#e8851d", "Pop FM"], ["Radio 100", "#2b72b5", "100"], ["The Voice", "#101010", "VOICE"],
+].map(([name, color, label], i) => ({
+  media_type: "radio",
+  uri: `library://radio/${i + 1}`,
+  name,
+  version: "",
+  image: `http://127.0.0.1:${process.env.MOCK_PORT ?? 8123}/imageproxy?path=${i}&provider=builtin`,
+  favorite: false,
+  _color: color,
+  _label: label,
+}));
+
+const logo = (index) => {
+  const st = STATIONS[Number(index)] ?? STATIONS[0];
+  return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 200 200"><rect width="200" height="200" fill="${st._color}"/><text x="100" y="115" font-family="Arial,sans-serif" font-weight="700" font-size="${st._label.length > 3 ? 44 : 78}" fill="#fff" text-anchor="middle">${st._label}</text></svg>`;
+};
+
+const sockets = new Set();
+const emitRegistry = () => {
+  for (const { ws, subscription } of sockets) if (subscription) ws.send(JSON.stringify({ id: subscription, type: "event", event: { event_type: "entity_registry_updated", data: {} } }));
+};
+const emit = (entity_id) => {
+  const new_state = states.get(entity_id);
+  for (const { ws, subscription } of sockets) {
+    if (subscription) ws.send(JSON.stringify({ id: subscription, type: "event", event: { event_type: "state_changed", data: { entity_id, new_state } } }));
+  }
+};
+
+// Sync groups of Music Assistant players: the leader's group_members lists everyone, leader first.
+const GROUPING = 524288;
+const MEDIA_KEYS = ["media_content_id", "media_content_type", "media_title", "media_artist", "media_album_name", "app_id"];
+
+function setGroup(leaderId, memberIds) {
+  const list = memberIds.length > 1 ? memberIds : [];
+  for (const id of memberIds) patch(id, (a) => (a.group_members = list));
+}
+
+function patch(id, fn, state) {
+  const s = states.get(id);
+  if (!s) return;
+  const next = { ...s, attributes: { ...s.attributes }, last_changed: new Date().toISOString() };
+  fn(next.attributes);
+  if (state) next.state = state;
+  states.set(id, next);
+  emit(id);
+}
+
+/** Members mirror the leader's playback, as Music Assistant does for synced players. */
+function mirrorLeader(leaderId) {
+  const leader = states.get(leaderId);
+  const members = leader?.attributes.group_members ?? [];
+  for (const id of members.filter((m) => m !== leaderId)) {
+    patch(id, (a) => MEDIA_KEYS.forEach((k) => (a[k] = leader.attributes[k])), leader.state);
+  }
+}
+
+function callGroupService({ service, service_data = {}, target = {} }) {
+  const ids = [].concat(target.entity_id ?? []);
+  if (service === "join") {
+    const leaderId = ids[0];
+    const current = states.get(leaderId)?.attributes.group_members ?? [];
+    const members = [...new Set([...(current.length ? current : [leaderId]), ...service_data.group_members])];
+    for (const m of service_data.group_members) {
+      // leaving a previous group first
+      const old = states.get(m)?.attributes.group_members ?? [];
+      if (old.length && old[0] !== leaderId) setGroup(old[0], old.filter((x) => x !== m));
+    }
+    setGroup(leaderId, members);
+    mirrorLeader(leaderId);
+  } else if (service === "unjoin") {
+    for (const id of ids) {
+      const group = states.get(id)?.attributes.group_members ?? [];
+      if (!group.length) continue;
+      patch(id, (a) => (a.group_members = []), "idle");
+      setGroup(group[0], group.filter((m) => m !== id));
+    }
+  }
+}
+
+function callService({ domain, service, service_data = {}, target = {} }) {
+  if (domain === "media_player" && (service === "join" || service === "unjoin")) {
+    callGroupService({ service, service_data, target });
+    console.log(`[mock-ha] ${domain}.${service}`, [].concat(target.entity_id ?? []).join(","), JSON.stringify(service_data));
+    return;
+  }
+  const ids = [].concat(target.entity_id ?? []);
+  for (const id of ids) {
+    const s = states.get(id);
+    if (!s) continue;
+    const next = { ...s, attributes: { ...s.attributes }, last_changed: new Date().toISOString() };
+    if (service === "turn_on" && domain === "light") {
+      next.state = "on";
+      if (service_data.brightness_pct != null) next.attributes.brightness = Math.round((service_data.brightness_pct / 100) * 255);
+    } else if (service === "turn_off") next.state = "off";
+    else if (service === "toggle") next.state = s.state === "on" ? "off" : "on";
+    else if (service === "media_play_pause") next.state = s.state === "playing" ? "paused" : "playing";
+    else if (service === "select_option") {
+      next.state = service_data.option;
+      if (id.endsWith("_operation")) patch(`sensor.${id.replace(/^select\./, "").replace(/_operation$/, "")}_current_status`, () => {}, service_data.option === "start" ? "running" : "end");
+    }
+    else if (domain === "todo" && todoItems.has(id)) {
+      const list = todoItems.get(id);
+      const find = (key) => list.find((i) => i.uid === String(key) || i.summary === String(key));
+      if (service === "add_item") list.push({ uid: String(++todoUid), summary: service_data.item, status: "needs_action", ...(service_data.due_date ? { due: service_data.due_date } : {}), ...(service_data.description ? { description: service_data.description } : {}) });
+      else if (service === "update_item") {
+        const item = find(service_data.item);
+        if (item) {
+          if (service_data.rename) item.summary = service_data.rename;
+          if (service_data.status) item.status = service_data.status;
+          if ("due_date" in service_data) item.due = service_data.due_date ?? undefined;
+          if ("description" in service_data) item.description = service_data.description ?? undefined;
+        }
+      } else if (service === "remove_item") {
+        for (const key of [].concat(service_data.item)) {
+          const item = find(key);
+          if (item) list.splice(list.indexOf(item), 1);
+        }
+      } else if (service === "remove_completed_items") todoItems.set(id, list.filter((i) => i.status !== "completed"));
+      todoCount(id);
+      emit(id);
+      continue;
+    } else if (domain === "vacuum") {
+      if (service === "start") next.state = "cleaning";
+      else if (service === "pause") next.state = "paused";
+      else if (service === "return_to_base") next.state = "docked";
+      else if (service === "set_fan_speed") next.attributes.fan_speed = service_data.fan_speed;
+    } else if (domain === "number" && service === "set_value") next.state = String(service_data.value);
+    else if (domain === "media_player" && service === "play_media" && /^https?:\/\//.test(String(service_data.media_content_id))) {
+      next.state = "playing";
+      console.log(`[mock-ha] stream ${service_data.media_content_type} ${service_data.media_content_id} on ${id}`);
+    } else if (domain === "media_player" && service === "play_media" && String(service_data.media_content_id).startsWith("plex://")) {
+      next.state = "playing";
+      next.attributes.media_title = `plex ${service_data.media_content_id}`;
+      console.log(`[mock-ha] plex play ${service_data.media_content_type} ${service_data.media_content_id} on ${id}`);
+    } else if (domain === "climate" && service === "set_temperature") next.attributes.temperature = service_data.temperature;
+    else if (domain === "climate" && service === "set_hvac_mode") next.state = service_data.hvac_mode;
+    else if (domain === "button" && service === "press") {
+      next.state = new Date().toISOString();
+      if (id.endsWith("manually_start_charging")) patch("sensor.ev_smart_charging_charging", () => {}, "on"), patch("sensor.ev_smart_charging_status", () => {}, "charging");
+      if (id.endsWith("manually_stop_charging")) patch("sensor.ev_smart_charging_charging", () => {}, "off"), patch("sensor.ev_smart_charging_status", () => {}, "no_charging_planned");
+    } else if (service === "media_pause") next.state = "paused";
+    else if (service === "media_play") next.state = "playing";
+    else if (service === "media_stop") next.state = "idle";
+    else if (domain === "music_assistant" && service === "play_media") {
+      const station = STATIONS.find((st) => st.uri === service_data.media_id);
+      Object.assign(next.attributes, {
+        media_content_id: service_data.media_id,
+        media_content_type: "music",
+        media_title: station ? "We're Good" : service_data.media_id,
+        media_artist: "Dua Lipa",
+        media_album_name: station ? station.name : undefined,
+        app_id: "music_assistant",
+        entity_picture: `/api/media_player_proxy/${id}?token=mock&cache=${Date.now()}`,
+        media_duration: 215,
+        media_position: 12,
+        media_position_updated_at: new Date().toISOString(),
+      });
+      next.state = "playing";
+    } else if (service === "volume_set") next.attributes.volume_level = service_data.volume_level;
+    else if (service === "set_temperature") next.attributes.temperature = service_data.temperature;
+    else if (service === "set_hvac_mode") next.state = service_data.hvac_mode;
+    else if (service === "set_fan_mode") next.attributes.fan_mode = service_data.fan_mode;
+    else if (service === "set_swing_mode") next.attributes.swing_mode = service_data.swing_mode;
+    states.set(id, next);
+    emit(id);
+    if ((next.attributes.group_members ?? []).length) mirrorLeader(next.attributes.group_members[0]);
+  }
+  console.log(`[mock-ha] ${domain}.${service}`, ids.join(","), JSON.stringify(service_data));
+}
+
+let flowCounter = 0;
+const slugOf = (name) => name.toLowerCase().normalize("NFKD").replace(/[^a-z0-9]+/g, "_").replace(/^_+|_+$/g, "") || "list";
+// Home Assistant's image integration: uploads are kept in memory and served back.
+const uploadedImages = new Map();
+const server = http.createServer((req, res) => {
+  const url = new URL(req.url, "http://localhost");
+  if (req.method === "GET" && url.pathname === "/api/camera_proxy/camera.front_door") {
+    const image = fs.readFileSync(new URL("../web/img/rooms/room.jpg", import.meta.url));
+    res.writeHead(200, { "Content-Type": "image/jpeg", "Content-Length": image.length });
+    return res.end(image);
+  }
+  // Native state API for previewing weather/day-night changes without a real HA instance.
+  const weatherState = url.pathname.match(/^\/api\/states\/((?:weather|sun)\.[a-z0-9_]+)$/);
+  if (weatherState) {
+    const id = weatherState[1];
+    const send = (status, data) => { res.writeHead(status, { "Content-Type": "application/json" }); res.end(JSON.stringify(data)); };
+    if (req.method === "GET") return states.has(id) ? send(200, states.get(id)) : send(404, { message: "Entity not found" });
+    if (req.method !== "POST") return send(405, { message: "Method not allowed" });
+    const chunks = [];
+    req.on("data", (chunk) => chunks.push(chunk));
+    req.on("end", () => {
+      let data;
+      try { data = JSON.parse(Buffer.concat(chunks).toString()); }
+      catch { return send(400, { message: "Invalid JSON" }); }
+      if (typeof data?.state !== "string" || (data.attributes != null && (typeof data.attributes !== "object" || Array.isArray(data.attributes)))) return send(400, { message: "Expected state and optional attributes" });
+      put(id, data.state, data.attributes ?? states.get(id)?.attributes ?? {});
+      emit(id);
+      send(200, states.get(id));
+    });
+    return;
+  }
+  if (req.method === "POST" && url.pathname === "/api/image/upload") {
+    const chunks = [];
+    req.on("data", (c) => chunks.push(c));
+    req.on("end", () => {
+      const body = Buffer.concat(chunks);
+      const start = body.indexOf("\r\n\r\n") + 4;
+      const end = body.lastIndexOf("\r\n--");
+      const id = `img${uploadedImages.size + 1}${Date.now().toString(36)}`;
+      uploadedImages.set(id, body.subarray(start, end));
+      console.log(`[mock-ha] image uploaded ${id} (${end - start} bytes)`);
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ id, content_type: "image/jpeg" }));
+    });
+    return;
+  }
+  const served = url.pathname.match(/^\/api\/image\/serve\/([^/]+)\/original$/);
+  if (served) {
+    const image = uploadedImages.get(served[1]);
+    if (!image) {
+      res.writeHead(404);
+      return res.end();
+    }
+    res.writeHead(200, { "Content-Type": "image/jpeg", "Content-Length": image.length });
+    return res.end(req.method === "HEAD" ? undefined : image);
+  }
+  // Home Assistant's config entries API (creating and removing Local To-do lists)
+  if (url.pathname.startsWith("/api/config/config_entries/")) {
+    if (req.headers.authorization !== "Bearer dev") {
+      res.writeHead(401);
+      return res.end();
+    }
+    let raw = "";
+    req.on("data", (c) => (raw += c));
+    req.on("end", () => {
+      const body = raw ? JSON.parse(raw) : {};
+      const send = (status, data) => (res.writeHead(status, { "Content-Type": "application/json" }), res.end(JSON.stringify(data)));
+      if (req.method === "POST" && url.pathname === "/api/config/config_entries/flow") {
+        if (process.env.MOCK_NO_LOCAL_TODO === "1") return send(400, { message: "Invalid handler specified" });
+        return send(200, { type: "form", flow_id: `flow${++flowCounter}`, handler: body.handler, step_id: "user", data_schema: [{ type: "string", name: "todo_list_name", required: true }] });
+      }
+      const flow = url.pathname.match(/^\/api\/config\/config_entries\/flow\/(flow\d+)$/);
+      if (flow && req.method === "DELETE") return send(200, {});
+      if (flow && req.method === "POST") {
+        const name = String(body.todo_list_name ?? "").trim();
+        const id = `todo.${slugOf(name)}`;
+        if (!name || todoItems.has(id)) return send(200, { type: "form", flow_id: flow[1], errors: { base: "already_configured" }, data_schema: [{ type: "string", name: "todo_list_name", required: true }] });
+        todoCreate(id, name, "local_todo");
+        registry.entities.push({ ei: id, pl: "local_todo" });
+        emit(id);
+        emitRegistry();
+        return send(200, { type: "create_entry", flow_id: flow[1], result: { entry_id: todoMeta.get(id).entry, domain: "local_todo", title: name } });
+      }
+      const entry = url.pathname.match(/^\/api\/config\/config_entries\/entry\/([^/]+)$/);
+      if (entry && req.method === "DELETE") {
+        for (const [id, meta] of todoMeta) {
+          if (meta.entry !== entry[1]) continue;
+          todoItems.delete(id);
+          todoMeta.delete(id);
+          states.delete(id);
+          registry.entities = registry.entities.filter((e) => e.ei !== id);
+          for (const { ws, subscription } of sockets) if (subscription) ws.send(JSON.stringify({ id: subscription, type: "event", event: { event_type: "state_changed", data: { entity_id: id, new_state: null } } }));
+          emitRegistry();
+        }
+        return send(200, { require_restart: false });
+      }
+      return send(404, { message: "Not found" });
+    });
+    return;
+  }
+  const pictureMatch = url.pathname.match(/^\/api\/media_player_proxy\/(media_player\.[a-z0-9_]+)$/);
+  if (pictureMatch) {
+    const label = pictureMatch[1].split(".")[1].slice(0, 2).toUpperCase();
+    res.writeHead(200, { "Content-Type": "image/svg+xml" });
+    return res.end(`<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 300 300"><defs><linearGradient id="g" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#2e86ab"/><stop offset="1" stop-color="#e4572e"/></linearGradient></defs><rect width="300" height="300" fill="url(#g)"/><circle cx="150" cy="150" r="95" fill="rgba(0,0,0,.2)"/><circle cx="150" cy="150" r="20" fill="rgba(255,255,255,.8)"/><text x="18" y="46" font-family="Arial" font-weight="700" font-size="30" fill="rgba(255,255,255,.85)">${label}</text></svg>`);
+  }
+  // a tiny Plex server for stream links (set PLEX_URL=http://127.0.0.1:8123 PLEX_TOKEN=tok)
+  const plexMeta = url.pathname.match(/^\/library\/metadata\/(\d+)(\/allLeaves|\/children)?$/);
+  if (plexMeta) {
+    if (req.headers["x-plex-token"] !== "tok") {
+      res.writeHead(401);
+      return res.end();
+    }
+    const key = Number(plexMeta[1]);
+    const one = (k, type, title, mkv) => ({ ratingKey: String(k), type, title, viewOffset: k === 2001 ? 754000 : 0, Media: [{ container: mkv ? "mkv" : "mp4", videoCodec: mkv ? "hevc" : "h264", audioCodec: mkv ? "dts" : "aac", Part: [{ key: `/library/parts/${k}/1/file.${mkv ? "mkv" : "mp4"}`, container: mkv ? "mkv" : "mp4" }] }] });
+    const list = plexMeta[2] ? [one(key * 100 + 1, "episode", "Episode 1"), one(key * 100 + 2, "episode", "Episode 2")] : [one(key, key === 2001 ? "episode" : "movie", PLEX_TITLES[key] ?? "Title", key % 2 === 1)];
+    res.writeHead(200, { "Content-Type": "application/json" });
+    return res.end(JSON.stringify({ MediaContainer: { Metadata: list } }));
+  }
+  const plexImage = url.pathname.match(/^\/api\/plex_image_proxy\/([a-z0-9]+)\/(\d+)$/);
+  if (plexImage) {
+    res.writeHead(200, { "Content-Type": "image/svg+xml" });
+    return res.end(plexPoster(plexImage[2]));
+  }
+  const restCalendar = url.pathname.match(/^\/api\/calendars\/(calendar\.[a-z0-9_]+)$/);
+  if (restCalendar) {
+    const from = new Date(url.searchParams.get("start"));
+    const to = new Date(url.searchParams.get("end"));
+    const list = pageEvents.filter((e) => e.calendar === restCalendar[1] && e.start < to && e.end > from).map(restEvent);
+    res.writeHead(200, { "Content-Type": "application/json" });
+    return res.end(JSON.stringify(list));
+  }
+  if (url.pathname === "/imageproxy") {
+    res.writeHead(200, { "Content-Type": "image/svg+xml" });
+    return res.end(logo(url.searchParams.get("path")));
+  }
+  res.writeHead(404);
+  res.end();
+});
+const wss = new WebSocketServer({ server, path: "/api/websocket" });
+wss.on("connection", (ws) => {
+  const entry = { ws, subscription: null };
+  sockets.add(entry);
+  ws.send(JSON.stringify({ type: "auth_required", ha_version: "mock" }));
+  ws.on("close", () => sockets.delete(entry));
+  ws.on("message", (raw) => {
+    const msg = JSON.parse(raw.toString());
+    const reply = (result) => ws.send(JSON.stringify({ id: msg.id, type: "result", success: true, result }));
+    if (msg.type === "auth") return ws.send(JSON.stringify({ type: msg.access_token ? "auth_ok" : "auth_invalid", ha_version: "mock" }));
+    if (msg.type === "ping") return ws.send(JSON.stringify({ id: msg.id, type: "pong" }));
+    if (msg.type === "get_states") return reply([...states.values()]);
+    if (msg.type === "get_config") return reply(MOCK_ENERGY_CONFIG);
+    if (msg.type === "energy/get_prefs") {
+      const prefs = mockEnergyPreferences(process.env.MOCK_ENERGY_SETUP);
+      return prefs ? reply(prefs) : ws.send(JSON.stringify({ id: msg.id, type: "result", success: false, error: { code: "not_found", message: "No prefs" } }));
+    }
+    if (msg.type === "energy/info") return reply(MOCK_ENERGY_INFO);
+    if (msg.type === "recorder/get_statistics_metadata") return reply(mockEnergyMetadata(msg.statistic_ids));
+    if (msg.type === "recorder/statistics_during_period") return reply(mockEnergyStatistics(msg, { mode: process.env.MOCK_ENERGY_SETUP }));
+    if (msg.type === "config/area_registry/list") return reply(registry.areas);
+    if (msg.type === "config/area_registry/update") {
+      const area = registry.areas.find((a) => a.area_id === msg.area_id);
+      if (!area) return ws.send(JSON.stringify({ id: msg.id, type: "result", success: false, error: { code: "not_found", message: "Area not found" } }));
+      if ("picture" in msg) area.picture = msg.picture;
+      console.log(`[mock-ha] area ${msg.area_id} picture ${msg.picture}`);
+      reply(area);
+      for (const { ws: other, subscription } of sockets) if (subscription) other.send(JSON.stringify({ id: subscription, type: "event", event: { event_type: "area_registry_updated", data: { action: "update", area_id: msg.area_id } } }));
+      return;
+    }
+    if (msg.type === "config/floor_registry/list") return reply(registry.floors);
+    if (msg.type === "config/device_registry/list") return reply(registry.devices);
+    if (msg.type === "config/entity_registry/list_for_display") return reply({ entity_categories: {}, entities: registry.entities });
+    if (msg.type === "calendar/event/create") {
+      pageEvents.push(applyPageEvent(msg.entity_id, msg.event, { uid: `new${Date.now()}` }));
+      console.log(`[mock-ha] calendar event created: ${msg.event.summary} (${msg.event.dtstart})`);
+      return reply(null);
+    }
+    if (msg.type === "calendar/event/update") {
+      const i = pageEvents.findIndex((e) => e.uid === msg.uid && e.calendar === msg.entity_id);
+      if (i < 0) return ws.send(JSON.stringify({ id: msg.id, type: "result", success: false, error: { code: "not_found", message: "Event not found" } }));
+      pageEvents[i] = applyPageEvent(msg.entity_id, msg.event, { uid: msg.uid });
+      console.log(`[mock-ha] calendar event updated: ${msg.event.summary}`);
+      return reply(null);
+    }
+    if (msg.type === "calendar/event/delete" && pageEvents.some((e) => e.uid === msg.uid)) {
+      pageEvents.splice(pageEvents.findIndex((e) => e.uid === msg.uid), 1);
+      console.log(`[mock-ha] calendar event deleted: ${msg.uid}`);
+      return reply(null);
+    }
+    if (msg.type === "calendar/event/delete") {
+      const i = mealEvents.findIndex((e) => e.uid === msg.uid);
+      if (i >= 0) mealEvents.splice(i, 1);
+      return reply(null);
+    }
+    if (msg.type === "todo/item/list") {
+      const list = todoItems.get(msg.entity_id);
+      return list ? reply({ items: list.map((i) => ({ ...i })) }) : ws.send(JSON.stringify({ id: msg.id, type: "result", success: false, error: { code: "not_found", message: "Entity not found" } }));
+    }
+    if (msg.type === "config/entity_registry/get") {
+      const meta = todoMeta.get(msg.entity_id);
+      return meta ? reply({ entity_id: msg.entity_id, config_entry_id: meta.entry, platform: meta.platform }) : ws.send(JSON.stringify({ id: msg.id, type: "result", success: false, error: { code: "not_found", message: "Entity not found" } }));
+    }
+    if (msg.type === "config/entity_registry/update") {
+      patch(msg.entity_id, (a) => (a.friendly_name = msg.name));
+      emitRegistry();
+      return reply({ entity_entry: { entity_id: msg.entity_id, name: msg.name } });
+    }
+    if (msg.type === "subscribe_events") {
+      entry.subscription = msg.id;
+      return reply(null);
+    }
+    if (msg.type === "config_entries/get") {
+      if (msg.domain === "mealie" && !process.env.MOCK_NO_MEALIE) return reply([{ entry_id: "01MOCKMEALIEENTRY", domain: "mealie", state: "loaded", title: "Mealie" }]);
+      return reply(msg.domain === "music_assistant" ? [{ entry_id: "01MOCKMAENTRY", domain: "music_assistant", state: "loaded", title: "Music Assistant" }] : []);
+    }
+    if (msg.type === "call_service" && msg.domain === "music_assistant" && msg.service === "get_library") {
+      const items = STATIONS.map(({ _color, _label, ...item }) => item);
+      return reply({ context: {}, response: { items, limit: msg.service_data.limit, offset: 0, order_by: "name", media_type: "radio" } });
+    }
+    if (msg.type === "media_player/browse_media") {
+      try {
+        return reply(plexBrowse(msg));
+      } catch (err) {
+        return ws.send(JSON.stringify({ id: msg.id, type: "result", success: false, error: { code: "failed", message: err.message } }));
+      }
+    }
+    if (msg.type === "call_service" && msg.domain === "mealie") {
+      const response = mockMealie(msg);
+      if (!response && msg.service !== "import_recipe" && msg.service !== "get_recipes") return ws.send(JSON.stringify({ id: msg.id, type: "result", success: false, error: { code: "service_validation_error", message: "Recipe not found in Mealie" } }));
+      if (!response) return ws.send(JSON.stringify({ id: msg.id, type: "result", success: false, error: { code: "service_validation_error", message: "Could not import recipe" } }));
+      return reply({ context: {}, response });
+    }
+    if (msg.type === "call_service" && msg.domain === "ai_task" && msg.service === "generate_data") {
+      return setTimeout(() => reply({ context: {}, response: { data: mockAi(String(msg.service_data.instructions ?? "")), conversation_id: "mock" } }), Number(process.env.MOCK_AI_DELAY ?? 300));
+    }
+    if (msg.type === "call_service" && msg.domain === "calendar" && msg.service === "create_event") {
+      mealEvents.push({ uid: `ev${mealEvents.length + 1}-${Date.now()}`, calendar: [].concat(msg.target?.entity_id ?? [])[0], summary: msg.service_data.summary, description: msg.service_data.description, start: msg.service_data.start_date_time, end: msg.service_data.end_date_time });
+      console.log(`[mock-ha] calendar.create_event ${msg.service_data.start_date_time} ${msg.service_data.summary}`);
+      return reply({ context: {} });
+    }
+    if (msg.type === "call_service" && msg.domain === "calendar" && msg.service === "get_events") {
+      const wanted = msg.target?.entity_id ?? [];
+      const from = String(msg.service_data.start_date_time ?? "").slice(0, 10);
+      const to = String(msg.service_data.end_date_time ?? "").slice(0, 10);
+      const created = (id) => mealEvents.filter((e) => e.calendar === id && (!from || (e.start.slice(0, 10) >= from && e.start.slice(0, 10) < to))).map((e) => ({ uid: e.uid, summary: e.summary, description: e.description, start: e.start, end: e.end }));
+      return reply({ context: {}, response: Object.fromEntries(wanted.map((id) => [id, { events: id === "calendar.madplan" ? created(id) : calendarEvents(id) }])) });
+    }
+    if (msg.type === "call_service" && msg.domain === "weather" && msg.service === "get_forecasts") {
+      const id = [msg.target?.entity_id].flat()[0];
+      return reply({ context: {}, response: { [id]: { forecast: forecastDays() } } });
+    }
+    if (msg.type === "call_service") {
+      callService(msg);
+      return reply({ context: {} });
+    }
+    reply(null);
+  });
+});
+server.listen(Number(process.env.MOCK_PORT ?? 8123), () => console.log(`[mock-ha] listening on :${server.address().port}`));
