@@ -18,7 +18,7 @@ The Home faces use the first visible dashboard page and its configured quick act
 
 Supported dashboard pages provide basic home actions, climate controls, area devices, music/media playback controls, car controls, read-only calendar agendas and Energy totals. Hidden menu items and device visibility are respected. Calendar editing, music-library browsing, Plex browsing, meal planning, family boards, to-do lists, device editing, standard-dashboard animations and advanced tile layouts are not part of this frontend. Unsupported tile types are marked as unavailable.
 
-The backend was copied from Dasher to preserve existing configuration, entity discovery, state streaming and service permissions. Inherited options for unsupported features do not enable their missing frontend pages.
+The backend retains entity discovery, state streaming and service permissions for the Apple dashboard. Unsupported inherited dashboard sections and menu entries are ignored; their APIs and background jobs are not available.
 
 ## App options
 
@@ -39,8 +39,6 @@ Restart the app after changing its options.
 | `legacy_camera_interval` | Seconds between snapshots, 10-3600; default 30. |
 | `enable_calendar` | Enable the read-only calendar agenda without adding a `calendar:` section. |
 | `allow_area_picture_upload` | Let the backend add built-in room pictures to HA areas that have none. Pictures you choose are preserved. |
-
-Other inherited backend options are retained for configuration compatibility, not as a promise of standard-dashboard features.
 
 ## Wallpaper, photos and cameras
 
@@ -66,7 +64,7 @@ This is an unofficial Apple-inspired web dashboard, not a native Apple widget. T
 
 ## Development and releases
 
-From `dasher-apple/app`, run `npm ci`, `npm test`, then `npm run dev`. The development command starts fake Home Assistant and Music Assistant services. The dashboard opens on port 8100. Override `MOCK_PORT`, `MA_PORT` and `PORT` if needed.
+From `dasher-apple/app`, run `npm ci`, `npm test`, then `npm run dev`. The development command starts a fake Home Assistant service. The dashboard opens on port 8100. Override `MOCK_PORT` and `PORT` if needed.
 
 Against a real HA installation, set `HA_URL` and `HA_TOKEN`, plus `CONFIG_DIR` and `DATA_DIR`, and run `npm start`. Inside the Home Assistant app, the Supervisor token is used automatically.
 

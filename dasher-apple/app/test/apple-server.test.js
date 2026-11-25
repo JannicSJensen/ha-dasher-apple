@@ -61,7 +61,6 @@ test("Apple entrypoint, assets and standalone backend work without another Dashe
   const url = await start(t, "src/index.js", {
     HA_URL: haUrl, HA_TOKEN: "dev", PORT: "0", LOG_LEVEL: "info",
     OPTIONS_FILE: optionsFile, CONFIG_DIR: path.join(dir, "config"), DATA_DIR: path.join(dir, "data"),
-    MA_URL: "", MA_TOKEN: "",
   });
 
   for (const route of ["/", "/legacy"]) {
@@ -100,4 +99,56 @@ test("Apple entrypoint, assets and standalone backend work without another Dashe
   assert.equal(addon.slug, "dasher_apple");
   assert.equal(addon.ingress_port, 8100);
   assert.equal(addon.ports["8100/tcp"], 8100);
+});
+
+test("inherited features cannot be accessed even when old configuration enables them", { timeout: 20_000 }, async (t) => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "dasher-apple-inherited-"));
+  t.after(() => fs.rm(dir, { recursive: true, force: true }));
+  const configDir = path.join(dir, "config");
+  await fs.mkdir(configDir);
+  await fs.writeFile(path.join(configDir, "dashboard.yaml"), `
+pages:
+  - id: home
+    tiles:
+      - { type: toggle, entity: light.living_room_lamp }
+calendar: { entities: [calendar.family] }
+family: { people: [{ entity: person.old, pin: "1234" }] }
+meals: { enabled: true, auto: { weekday: wed, time: "00:00" }, shopping_list_entity: todo.old }
+todo: { lists: [todo.old] }
+devices: { vacuums: [vacuum.old] }
+`);
+  const options = path.join(dir, "options.json");
+  await fs.writeFile(options, JSON.stringify({ allow_area_picture_upload: false }));
+  const haUrl = await start(t, "dev/mock-ha.js", { MOCK_PORT: "0" });
+  const url = await start(t, "src/index.js", {
+    HA_URL: haUrl, HA_TOKEN: "dev", PORT: "0", OPTIONS_FILE: options,
+    CONFIG_DIR: configDir, DATA_DIR: path.join(dir, "data"),
+  });
+  for (let attempt = 0; attempt < 50; attempt++) {
+    if ((await (await fetch(url + "/healthz")).json()).ha) break;
+    await delay(50);
+  }
+  assert.equal((await (await fetch(url + "/healthz")).json()).ha, true);
+  const config = (await (await fetch(url + "/api/config")).json()).config;
+  for (const section of ["family", "meals", "todo", "devices"]) assert.equal(config[section], undefined);
+  const service = (entity, domain, action) => fetch(url + "/api/service", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ domain, service: action, entity_id: entity, data: {} }),
+  });
+  assert.equal((await service("light.living_room_lamp", "light", "toggle")).status, 200);
+  assert.equal((await service("todo.old", "todo", "add_item")).status, 400);
+  for (const route of ["/api/family", "/api/meals", "/api/todo/items", "/api/music/library", "/api/plex/home"]) {
+    assert.equal((await fetch(url + route)).status, 404, route);
+  }
+  for (const route of ["/api/family/chore-save", "/api/meals/generate", "/api/todo/create", "/api/calendar/event", "/api/areas/device", "/api/music/play", "/api/plex/play"]) {
+    assert.equal((await fetch(url + route, { method: "POST" })).status, 405, route);
+  }
+  const calendar = await fetch(url + "/api/calendar/view?start=2026-01-01T00:00:00Z&end=2026-01-08T00:00:00Z");
+  assert.equal(calendar.status, 200);
+  assert.equal((await calendar.json()).editable, false);
+  assert.equal((await fs.readdir(path.join(dir, "data")).catch((err) => {
+    if (err.code === "ENOENT") return [];
+    throw err;
+  })).includes("meals.json"), false);
 });

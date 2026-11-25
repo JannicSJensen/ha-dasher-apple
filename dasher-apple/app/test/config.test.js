@@ -68,6 +68,26 @@ test("collectEntities handles `entities` lists", () => {
   assert.deepEqual([...collectEntities({ entities: ["light.a", "light.b"] })], ["light.a", "light.b"]);
 });
 
+test("unsupported sections and tiles do not add watched or controllable entities", () => {
+  const result = parseConfig(`
+pages:
+  - id: home
+    tiles:
+      - { type: toggle, entity: light.keep }
+      - { type: family, entity: person.unused }
+family: { people: [{ entity: person.private }] }
+todo: { lists: [todo.unused] }
+meals: { shopping_list_entity: todo.shopping }
+devices: { vacuums: [vacuum.unused] }
+ambient: { buttons: [{ icon: bulb, entity: light.unused }] }
+`, { menuItems: [{ id: "family", visible: true }, { id: "page:home", title: "Main" }] });
+  assert.deepEqual(result.errors, []);
+  assert.deepEqual([...result.entities], ["light.keep"]);
+  assert.deepEqual([...result.rawEntities], ["light.keep"]);
+  assert.equal(result.config.pages[0].title, "Main");
+  assert.equal(result.config.family, undefined);
+});
+
 test("app, package, lockfile and latest changelog release versions match", async () => {
   const { readFileSync } = await import("node:fs");
   const { default: YAML } = await import("yaml");
@@ -122,21 +142,18 @@ radio:
   exclude: media_player.skip
   default_player: sensor.bad
 `);
-  assert.equal(errors.length, 2);
+  assert.equal(errors.length, 1);
   assert.deepEqual(config.music.players, ["media_player.a"]);
   assert.deepEqual(config.music.exclude, ["media_player.skip"]);
-  assert.equal(config.music.default_player, null);
   assert.deepEqual([...entities], ["media_player.a"]);
 });
 
-test("music section: `radio:` is an alias, tabs are validated", () => {
+test("music section: `radio:` is an alias and inherited library tabs are ignored", () => {
   const alias = parseConfig("pages:\n  - id: a\nradio:\n  title: Radio\n").config.music;
   assert.equal(alias.title, "Radio");
-  assert.deepEqual(alias.tabs, ["discover", "radio", "albums", "artists", "podcasts", "party", "search"]);
-
   const { config, errors } = parseConfig("pages:\n  - id: a\nmusic:\n  tabs: [albums, albums, nope, search]\n");
-  assert.deepEqual(config.music.tabs, ["albums", "search"]);
-  assert.equal(errors.length, 1);
+  assert.equal(config.music.tabs, undefined);
+  assert.deepEqual(errors, []);
 });
 
 test("every app option has a translation in each language, and the YAML files parse", async () => {

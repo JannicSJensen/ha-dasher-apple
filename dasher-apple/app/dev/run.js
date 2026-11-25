@@ -1,7 +1,6 @@
 import { spawn } from "node:child_process";
 
 const haPort = process.env.MOCK_PORT ?? "8123";
-const maPort = process.env.MA_PORT ?? "8095";
 const children = [];
 let stopping = false;
 
@@ -28,13 +27,10 @@ function start(script, env) {
 }
 
 start("dev/mock-ha.js", { MOCK_PORT: haPort });
-start("dev/mock-ma.js", { MA_PORT: maPort });
 start("src/index.js", {
   SUPERVISOR_TOKEN: "",
   HA_URL: `http://127.0.0.1:${haPort}`,
   HA_TOKEN: "dev",
-  MA_URL: `http://127.0.0.1:${maPort}`,
-  MA_TOKEN: "dev-token",
   CONFIG_DIR: "./dev/config",
   DATA_DIR: "./dev/data",
 });

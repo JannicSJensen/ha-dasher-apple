@@ -1,225 +1,66 @@
-# Dasher dashboard configuration.
-# Edit this file and save: connected tablets reload automatically.
-#
-# Images: put files in the "assets" folder next to this file and refer to them
-# by name (e.g. image: living-room.jpg). Full https:// URLs work too.
-# Icons: any Material Design Icon, see https://pictogrammers.com/library/mdi/
-# Replace every entity id below with your own entities.
+# Dasher Apple dashboard. Edit and save; connected tablets reload automatically.
+# Replace the example entity IDs with entities from your Home Assistant.
 
 title: Home
-language: en          # en | da  (UI texts)
-# locale: en-GB       # number/date formatting, defaults to the language
-accent: "#2dd4bf"
-idle_return: 120      # seconds of inactivity before returning to the first page (0 = off)
+language: en
+# locale: en-GB
 
-# Every page is a grid. A tile is placed with col/row (1-based) and spans w x h cells.
-columns: 4
-rows: 2
-gap: 8
-
-# The calendar page (Kalender): a month view and a planner (the week with a column per calendar), a detail view
-# of each event, and adding, changing and deleting events on calendars that allow it. Off unless this section exists
-# (or the app option); `calendar: true` shows every calendar of Home Assistant.
-# calendar:
-#   title: Kalender
-#   view: month                 # the view to open: month | planner
-#   week_start: mon             # mon | sun
-#   entities: [calendar.family, calendar.mor]   # default: every calendar
-#   names: { calendar.family: Familien, calendar.mor: Mor }
-#   colors: { calendar.family: "#38bdf8", calendar.mor: "#fb923c" }
-
-# The family board (Familie): who is home, chores that earn stars, rewards to spend them on, and the log of the
-# stars. Off unless this section exists; `family: true` uses every person of Home Assistant.
-# family:
-#   title: Familie
-#   allow_negative: false     # true = children may spend more stars than they have (they owe the rest)
-#   people:
-#     - { entity: person.mor, name: Mor, avatar: "👩", color: "#f472b6", role: adult, pin: "1234", calendar_entity: calendar.mor }
-#     - { entity: person.emil, name: Emil, color: "#4ade80", role: child }     # role: adult (default) | child
-
-# The ambient screen: after a while without touch a calm clock fills the screen (orb, big time, a few quick
-# buttons). A tap brings the dashboard back. Off unless you set `after` (seconds) or `ambient: 600`.
-# ambient:
-#   after: 600
-#   brightness: 0.8         # 0.1 - 1, lower is darker
-#   time_format: 24h
-#   buttons:                # up to four, like the buttons of the front page tile
-#     - { icon: weather-night, name: Good night, entity: input_boolean.good_night }
-#     - { icon: lightbulb-group, name: All lights, entity: light.living_room_lamp }
-
-# Area pages: adds a menu entry that lists every area in Home Assistant as a picture.
-# Tapping one opens the area with its lights, players, temperature, humidity and windows.
-# Pictures: the picture of the area in Home Assistant (Settings, Areas) is used. Areas without one get a built-in
-# room picture (living room, kitchen, bedroom ...) uploaded there by the app; <area_id>.jpg in assets/areas/ also works.
+# These sections control the corresponding dashboard pages.
 areas:
-  # enabled: false          # remove the menu entry completely
-  # title: Areas
-  # hide: [home]            # area ids or names to leave out
-  # default_images: false   # no built-in room pictures
-  # domains: [light, fan, cover, media_player]   # also: switch, input_boolean
+  # enabled: false
+  # hide: [garage]
   # overrides:
-  #   living_room: { name: Lounge, icon: mdi:sofa, image: lounge.jpg, room: living, temperature_entity: sensor.lounge_temperature }
+  #   living_room: { name: Lounge, temperature_entity: sensor.lounge_temperature }
 
-# Music page: radio stations, discover, albums, artists, podcasts and search from Music Assistant,
-# played on its speakers. Appears automatically when the Music Assistant integration is installed.
-# Everything except Radio also needs music_assistant_url and music_assistant_token in the add-on options.
 music:
   # enabled: false
-  # title: Music
-  # tabs: [discover, radio, albums, artists, podcasts, party, search]
-  # players: [media_player.kitchen, media_player.living_room]   # default: all Music Assistant players
-  # default_player: media_player.living_room
-  # fullscreen: false          # do not open the full-screen player when music starts
+  # players: [media_player.kitchen, media_player.living_room]
+  # exclude: [media_player.bedroom]
 
-# Car page: start/stop charging, smart charging with its times, restart of the charger.
-# The EV Smart Charging and Peblar entities are found automatically; set the rest here.
-# The page only appears when something can be controlled.
 ev:
-  # enabled: false               # remove the menu entry
-  # name: My car
-  # image: car.jpg               # picture in the assets folder
+  # enabled: false
   # battery_entity: sensor.my_car_battery
   # range_entity: sensor.my_car_range
   # plug_entity: sensor.my_car_plug_status
 
-# The Climate page in the menu: a card per room with the temperature, the setpoint and a power button.
-# It lists your climate helpers (Settings > Devices & services > Helpers), not every thermostat.
 climate:
-  # source: helpers          # helpers | all
-  # entities: [climate.living_room, climate.office]   # or pick them yourself
-  # exclude: [climate.bathroom]
-  # title: Climate
+  # source: helpers  # helpers | all
+  # entities: [climate.living_room, climate.office]
 
-# The Media page: continue watching and recently added movies and series from Plex, played on a
-# Cast device or a Plex client. It appears when the Plex integration and such a player exist.
 plex:
-  # enabled: false           # remove the menu entry
-  # players: [media_player.living_room_tv]   # default: every Plex client and Cast device
-  # exclude: [media_player.kitchen_speaker]
-  # transcode: auto         # stream links (Apple TV, DLNA): auto | always | never
-  # title: Media
-
-# The to-do lists page (Huskelister): every to-do list of Home Assistant, with items you can add, tick off, edit and delete.
-# Lists of the Local To-do integration can also be created, renamed and deleted here.
-todo:
-  title: Huskelister
   # enabled: false
-  # lists: [todo.shopping_list, todo.chores]   # default: every to-do list
-  # exclude: [todo.old_list]
+  # players: [media_player.living_room_tv]
 
-# The Devices page: robot vacuums, washing machines, dryers, dishwashers and clothes heaters.
-# Vacuums and LG ThinQ appliances are found automatically; list anything else under appliances.
-devices:
-  # enabled: false
-  # vacuums: [vacuum.robbie]                 # default: every vacuum
-  # exclude: [vacuum.old_robot]
-  # appliances:
-  #   - { kind: dishwasher, name: Dishwasher, status_entity: sensor.dishwasher_status, remaining_entity: sensor.dishwasher_remaining, power_entity: switch.dishwasher }
-  #   - { kind: heater, name: Clothes heater, power_entity: switch.clothes_rack }   # kind: washer | dryer | dishwasher | heater
-
-# The Madplan page: a dinner plan for the week made with Home Assistant's AI Task (an AI integration such as
-# OpenAI, Google or Ollama must be set up), recipes, a shopping list and calendar entries. Everything is
-# optional; the page appears when Home Assistant has an AI Task entity, a to-do list or a calendar.
-meals:
-  # enabled: false
-  # title: Madplan
-  # shopping_list_entity: todo.shopping_list   # default: the Shopping list, or the first to-do list
-  # calendar_entity: calendar.family         # a dinner event is written here (default: calendar.family, when it exists)
-  # ai_task_entity: ai_task.openai            # default: the first AI Task entity
-  # household: 4                              # people at the table
-  # dinner_time: "18:00"
-  # language: da                              # the language of dishes and recipes
-  # auto: { weekday: sun, time: "17:00", days: 7 }   # plan the next week by itself
-  # mealie: false                           # ignore Mealie (it is used when its Home Assistant integration is set up)
-  # offers: { count: 5 }                    # Offers tab: stores shown per product; false = no tab
+# Read-only calendar page; set to true to show all Home Assistant calendars.
+# calendar:
+#   entities: [calendar.family, calendar.work]
 
 pages:
   - id: home
     title: Home
-    icon: home
     tiles:
       - type: hero
-        col: 1
-        row: 1
-        w: 2
-        h: 2
-        # Current weather animates over the background by default on the first page.
-        # The app option "Animated weather background" turns it off for every hero.
-        # weather_background: false       # restore this tile's picture/room
-        # weather_entity: weather.forecast_home   # default: calendar tile's weather, or the first HA weather entity
-        # sun_entity: sun.sun              # optional day/night source, found automatically when available
-        # image: living-room.jpg          # fallback when weather is unavailable or switched off
-        # backgrounds:                    # first matching entry wins
-        #   - when: { entity: light.living_room_lamp, state: "on" }
-        #     image: living-room-on.jpg
-        #   - when: { entity: sun.sun, state: below_horizon }
-        #     image: living-room-night.jpg
-        # With no image the tile shows a built-in room (scene: living | kitchen | bedroom ...; false = plain),
-        # dim, and lit while one of scene_entities is on. Button labels: button_labels: false hides them.
-        scene_entities: [light.living_room_lamp]
-        messages:                       # status messages on the front page (shown only while they apply)
-          - { entity: sensor.waste_general }       # a pick-up sensor: "Empty the trash can" today and tomorrow
-          - { entity: sensor.waste_paper }
-          - { entity: sensor.waste_plastic }
-          # A robot vacuum that needs its water changed also shows up here by itself (vacuum_water: false turns that off).
-          # - { entity: sensor.waste_paper, within_days: 2, name: Paper, title: Put out the paper }
-          # - { entity: binary_sensor.garage_door, text: The garage door is open, icon: garage-open }   # any entity that is on
+        # weather_entity: weather.forecast_home
         buttons:
-          - { icon: weather-night, name: Good night, entity: input_boolean.good_night }   # toggles, lit while on
+          - { icon: weather-night, name: Good night, entity: input_boolean.good_night }
           - { icon: palm-tree, name: Vacation, entity: input_boolean.vacation }
           - { icon: lightbulb-group, name: All lights, entity: light.living_room_lamp }
 
-      # Tonight's dinner from the Madplan page; tap it to open the recipe:
-      # - { type: dinner, col: 3, row: 2 }
-      # The cheapest offers per litre/kilo of a product you follow on the Offers tab:
-      # - { type: offers, product: pepsi-max, count: 3 }
-      # The family at a glance (stars and chores left); a tap opens the Familie page:
-      # - { type: family }
+      - type: calendar
+        # entities: [calendar.family, calendar.work]  # default: all calendars
+        weather_entity: weather.forecast_home
+        days: 7
 
-      - type: calendar                      # the next days with something planned, plus the forecast
-        col: 3
-        row: 1
-        # entities: [calendar.family, calendar.work]   # default: every calendar
-        # colors: ["#38bdf8", "#fb923c"]               # one colour per calendar, in the order above
-        weather_entity: weather.forecast_home          # optional: daily temperature and icon
-        days: 7                                        # how far ahead to look
-
-      # The electricity price can also be a tile of its own:
-      # - type: price
-      #   col: 3
-      #   row: 1
-      #   name: Electricity
-      #   entity: sensor.electricity_price      # needs a price list attribute, e.g. raw_today
-      #   multiplier: 100                       # convert kr -> øre
-      #   unit: øre
-      #   decimals: 0
-
-      - type: media                  # "now playing": follows whichever speaker plays, else shows the last track
-        col: 4
-        row: 1
-        entities: music                # every Music Assistant speaker; or a list: [media_player.a, media_player.b]
+      - type: media
+        entities: music  # Music Assistant speakers, or a list of media_player IDs
 
       - type: vehicle
-        col: 3
-        row: 2
         name: Car
-        icon: car-electric
         entity: sensor.car_range
-        # image: car.png
-        price:                                # optional: today's electricity price and 24h timeline at the bottom
-          entity: sensor.electricity_price    # needs a price list attribute, e.g. raw_today
-          multiplier: 100                     # convert kr -> øre
-          unit: øre
-          decimals: 0
         rows:
-          - { icon: battery-charging, entity: sensor.car_battery, label_entity: sensor.car_charging_state }
-          - { icon: gas-station, entity: sensor.car_fuel_level, label: fuel }
+          - { entity: sensor.car_battery }
+          - { entity: sensor.car_fuel_level }
 
       - type: toggle
-        col: 4
-        row: 2
         name: All lights
-        area: Indoor
         entity: light.living_room_lamp
-        # image_on: lamp-on.png
-        # image_off: lamp-off.png

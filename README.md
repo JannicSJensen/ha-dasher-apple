@@ -30,10 +30,10 @@ npm test
 npm run dev
 ```
 
-Open `http://localhost:8100/`. The development command starts fake Home Assistant and Music Assistant services and stops its children when interrupted. If their ports are already in use, override them, for example:
+Open `http://localhost:8100/`. The development command starts a fake Home Assistant service and stops its children when interrupted. If the ports are already in use, override them, for example:
 
 ```sh
-MOCK_PORT=18123 MA_PORT=18095 PORT=18100 npm run dev
+MOCK_PORT=18123 PORT=18100 npm run dev
 ```
 
 For a real Home Assistant connection, set `HA_URL`, `HA_TOKEN`, `CONFIG_DIR` and `DATA_DIR`, then run `npm start`. Keep tokens out of source control.
@@ -42,7 +42,7 @@ For a real Home Assistant connection, set `HA_URL`, `HA_TOKEN`, `CONFIG_DIR` and
 
 This project starts from [ha-dasher-addon](https://github.com/JannicSJensen/ha-dasher-addon), version 0.53.0, commit `a97c102004604b5cf88eb977e3adddb1b7b9869b`. It copies the backend, Apple/legacy frontend, required helper modules, room assets, mocks and relevant tests. The original standard dashboard entrypoint and unrelated frontend pages are not included.
 
-The backend is a local snapshot, not a package dependency, submodule or connection to another Dasher installation. Some inherited backend services and configuration options remain for compatibility; their presence does not mean their standard-dashboard UI is available here. Backend helpers and test support under `web/js/` are not a second dashboard.
+The backend is local, not a package dependency, submodule or connection to another Dasher installation. Inherited unsupported pages and APIs have been removed; old dashboard YAML can still contain unsupported sections, which are ignored. Backend helpers and test support under `web/js/` are not a second dashboard.
 
 The repositories evolve independently. Future fixes can be ported deliberately, but updates are not synchronized automatically. The original repository is unchanged by this extraction.
 

@@ -23,6 +23,17 @@ test("adds every built-in and custom page without altering existing overrides", 
   assert.throws(() => completeMenuOptions({}, pages), /not a list/);
 });
 
+test("retired built-in rows do not prevent similarly named custom pages from being added", () => {
+  const existing = [{ id: "family", visibility: "hide" }];
+  const result = completeMenuOptions(existing, [{ id: "family" }]);
+  assert.deepEqual(result[0], existing[0]);
+  assert.ok(result.some(({ id }) => id === "page:family"));
+  const parsed = parseConfig("pages:\n  - { id: family }\n", { menuItems: result });
+  assert.deepEqual(parsed.errors, []);
+  assert.ok(parsed.config.menu_items.some(({ id }) => id === "page:family"));
+  assert.ok(!parsed.config.menu_items.some(({ id }) => id === "family"));
+});
+
 test("new placeholder rows preserve all existing dashboard and legacy switch behavior", () => {
   const options = completeMenuOptions([], pages);
   assert.ok(options.every((item) => item.visibility === "default"));

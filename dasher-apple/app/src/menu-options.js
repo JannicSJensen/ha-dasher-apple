@@ -1,4 +1,4 @@
-import { BUILTIN_MENU_ITEMS } from "../web/js/lib/menu.js";
+import { BUILTIN_MENU_ITEMS, RETIRED_MENU_ITEMS } from "../web/js/lib/menu.js";
 
 export function completeMenuOptions(items, pages) {
   if (!Array.isArray(items)) throw new Error("Supervisor menu_items is not a list");
@@ -6,6 +6,7 @@ export function completeMenuOptions(items, pages) {
   const present = new Set(items.flatMap((item) => {
     if (typeof item?.id !== "string") return [];
     const id = item.id.trim();
+    if (RETIRED_MENU_ITEMS.has(id)) return [];
     return [builtins.has(id) || id.startsWith("page:") ? id : `page:${id}`];
   }));
   const missing = [

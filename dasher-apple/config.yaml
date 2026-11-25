@@ -1,5 +1,5 @@
 name: Dasher Apple
-version: "0.1.0"
+version: "0.2.0"
 slug: dasher_apple
 url: https://github.com/JannicSJensen/ha-dasher-apple
 description: Apple-inspired Home Assistant dashboard for older iPads
@@ -45,15 +45,8 @@ options:
   legacy_photo_interval: 120
   legacy_cameras: false
   legacy_camera_interval: 30
-  allow_todo_management: true
-  allow_area_editing: true
   allow_area_picture_upload: true
-  allow_meal_editing: true
-  allow_family_editing: true
-  enable_family: false
   enable_calendar: false
-  allow_calendar_editing: true
-  family_children: []
 schema:
   log_level: list(debug|info|warning|error)
   read_only: bool
@@ -77,17 +70,5 @@ schema:
       title: str?
       icon: str?
       order: int(0,)?
-  allow_todo_management: bool
-  allow_area_editing: bool
   allow_area_picture_upload: bool
-  allow_meal_editing: bool
-  allow_family_editing: bool
-  enable_family: bool
   enable_calendar: bool
-  allow_calendar_editing: bool
-  family_children:
-    - str
-  music_assistant_url: url?
-  music_assistant_token: password?
-  plex_url: url?
-  plex_token: password?

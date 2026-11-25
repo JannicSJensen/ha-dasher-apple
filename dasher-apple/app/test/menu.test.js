@@ -17,10 +17,9 @@ test("empty menu options preserve the existing defaults and sidebar order", () =
   const { config, errors } = parse();
   assert.deepEqual(errors, []);
   assert.deepEqual(config.menu_items, []);
-  assert.equal(config.family.enabled, false);
   assert.equal(config.calendar.enabled, false);
   const items = menuItems(config, ready, t);
-  assert.deepEqual(items.map((i) => i.key), ["page:home", "page:garage", "climate", "areas", "music", "meals", "todo", "devices", "media", "ev", "energy", "alarms"]);
+  assert.deepEqual(items.map((i) => i.key), ["page:home", "page:garage", "climate", "areas", "music", "media", "ev", "energy"]);
   assert.deepEqual(menuRoute("", items), { kind: "page", id: "home" });
   assert.deepEqual(menuRoute("#/unknown", items), { kind: "page", id: "home" });
 });
@@ -39,7 +38,7 @@ test("every built-in can be enabled, hidden, renamed and given an icon through a
   }
 });
 
-test("overrides preserve detailed page settings, legacy switches and entity mapping", () => {
+test("overrides preserve calendar settings and entity mapping while ignoring inherited menu entries", () => {
   const yaml = `${base}
 calendar:
   enabled: false
@@ -60,15 +59,16 @@ music:
   assert.deepEqual(result.errors, []);
   assert.deepEqual(result.config.calendar.entities, ["calendar.new"]);
   assert.equal(result.config.calendar.view, "planner");
-  assert.equal(result.config.family.people[0].pin, "1234");
+  assert.equal(result.config.family, undefined);
+  assert.ok(!result.entities.has("person.emil"));
   assert.equal(result.config.music.enabled, false, "a label-only override does not enable a page");
-  assert.deepEqual(result.config.music.tabs, ["radio"]);
+  assert.equal(result.config.music.tabs, undefined);
   assert.equal(result.config.music.title, "Speakers");
   assert.ok(result.entities.has("calendar.new"));
-  const legacy = parseConfig(base, { family: { enabled: true, children: ["person.emil"] }, calendarPage: true });
-  assert.deepEqual([legacy.config.family.enabled, legacy.config.calendar.enabled, legacy.config.family.children], [true, true, ["person.emil"]]);
-  const overridden = parseConfig(base, { family: { enabled: true }, calendarPage: true, menuItems: [{ id: "family", visible: false }, { id: "calendar", visible: false }] });
-  assert.deepEqual([overridden.config.family.enabled, overridden.config.calendar.enabled], [false, false]);
+  const legacy = parseConfig(base, { calendarPage: true });
+  assert.equal(legacy.config.calendar.enabled, true);
+  const overridden = parseConfig(base, { calendarPage: true, menuItems: [{ id: "family", visible: false }, { id: "calendar", visible: false }] });
+  assert.equal(overridden.config.calendar.enabled, false);
 });
 
 test("custom pages accept shorthand and explicit ids; hidden pages cannot be selected", () => {
@@ -76,7 +76,7 @@ test("custom pages accept shorthand and explicit ids; hidden pages cannot be sel
   assert.deepEqual(errors, []);
   assert.equal(config.pages[1].title, "Workshop");
   const items = menuItems(config, {}, t);
-  assert.deepEqual(items.map((i) => [i.key, i.title, i.icon]), [["page:garage", "Workshop", "tools"], ["alarms", "Alarms", "timer-outline"]]);
+  assert.deepEqual(items.map((i) => [i.key, i.title, i.icon]), [["page:garage", "Workshop", "tools"]]);
   assert.deepEqual(menuRoute("#/home", items), { kind: "page", id: "garage" });
   const collision = parse([{ id: "page:music", visible: false }], `${base}  - { id: music }\n`);
   assert.deepEqual(collision.errors, []);
@@ -88,7 +88,7 @@ test("numeric order interleaves custom and built-in pages with stable ties", () 
   const { config } = parse([{ id: "home", order: 10 }, { id: "calendar", visible: true, order: 0 }, { id: "garage", order: 0 }]);
   const items = menuItems(config, ready, t);
   assert.deepEqual(items.slice(0, 3).map((i) => i.key), ["page:garage", "calendar", "climate"]);
-  assert.ok(items.findIndex((i) => i.key === "page:home") > items.findIndex((i) => i.key === "devices"));
+  assert.ok(items.findIndex((i) => i.key === "page:home") > items.findIndex((i) => i.key === "media"));
   const { config: calendarFirst } = parse([{ id: "calendar", visible: true, order: 0 }, { id: "home", order: 1 }, { id: "garage", order: 2 }]);
   assert.deepEqual(menuRoute("", menuItems(calendarFirst, ready, t)), { kind: "calendar", id: null });
 });
@@ -100,13 +100,11 @@ test("routing preserves aliases, subpages and active icons, and rejects hidden b
     ["#/radio", { kind: "music", id: null }],
     ["#/media", { kind: "plex", id: null }],
     ["#/area/living%20room", { kind: "area", id: "living room" }],
-    ["#/todo/todo.shopping", { kind: "todo", id: "todo.shopping" }],
   ]) assert.deepEqual(menuRoute(hash, items), route);
   assert.ok(menuItemActive(items.find((i) => i.key === "areas"), { kind: "area", id: "living room" }));
-  assert.ok(menuItemActive(items.find((i) => i.key === "todo"), { kind: "todo", id: "todo.shopping" }));
   assert.ok(menuItemActive(items[0], { kind: "page", id: "home" }));
   assert.ok(!menuItemActive(items[0], { kind: "page", id: "garage" }));
-  const hidden = parse([{ id: "areas", visible: false }, { id: "music", visible: false }, { id: "todo", visible: false }]).config;
+  const hidden = parse([{ id: "areas", visible: false }, { id: "music", visible: false }]).config;
   const visible = menuItems(hidden, ready, t);
   for (const hash of ["#/areas", "#/area/living", "#/music", "#/radio", "#/todo/todo.shopping"]) {
     assert.deepEqual(menuRoute(hash, visible), { kind: "page", id: "home" });
@@ -140,11 +138,11 @@ test("page swipes skip menu entries shadowed by an available or pending built-in
 
 test("availability updates and pending data do not expose disabled menu items", () => {
   const { config } = parse([{ id: "home", visible: false }, { id: "garage", visible: false }, { id: "calendar", visible: true }]);
-  assert.deepEqual(menuItems(config, {}, t).map((i) => i.key), ["calendar", "alarms"]);
-  assert.deepEqual(menuItems(config, { music: { enabled: true } }, t).map((i) => i.key), ["music", "calendar", "alarms"]);
-  assert.deepEqual(menuItems(config, {}, t, { includePending: true }).map((i) => i.key), ["areas", "music", "calendar", "energy", "alarms"]);
+  assert.deepEqual(menuItems(config, {}, t).map((i) => i.key), ["calendar"]);
+  assert.deepEqual(menuItems(config, { music: { enabled: true } }, t).map((i) => i.key), ["music", "calendar"]);
+  assert.deepEqual(menuItems(config, {}, t, { includePending: true }).map((i) => i.key), ["areas", "music", "calendar", "energy"]);
   const hidden = parse([{ id: "areas", visible: false }, { id: "music", visible: false }, { id: "energy", visible: false }]).config;
-  assert.deepEqual(menuItems(hidden, {}, t, { includePending: true }).map((i) => i.key), ["page:home", "page:garage", "alarms"]);
+  assert.deepEqual(menuItems(hidden, {}, t, { includePending: true }).map((i) => i.key), ["page:home", "page:garage"]);
 });
 
 test("all menu items can be hidden without removing tile definitions or crashing routing", () => {

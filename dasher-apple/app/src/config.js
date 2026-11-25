@@ -3,12 +3,10 @@ import path from "node:path";
 import YAML from "yaml";
 import { AREA_DOMAINS, DEFAULT_AREA_DOMAINS } from "./areas.js";
 import { ROOM_TYPES } from "./room-images.js";
-import { DEFAULT_TABS, MUSIC_TABS } from "./music.js";
 import { collectEntities, describeUsage, mapEntities } from "../web/js/lib/entities.js";
 import { STOCK_EXAMPLE_HASHES, hashDashboard } from "./stock-examples.js";
-import { APPLIANCE_KINDS, APPLIANCE_ROLES } from "./devices.js";
 import { MAP_FILE, parseEntityMap, parseEntityMapOption } from "./mapping.js";
-import { BUILTIN_MENU_ITEMS } from "../web/js/lib/menu.js";
+import { BUILTIN_MENU_ITEMS, RETIRED_MENU_ITEMS } from "../web/js/lib/menu.js";
 
 export { collectEntities };
 
@@ -27,6 +25,14 @@ export const TILE_TYPES = new Set([
 ]);
 
 const ENTITY_RE = /^[a-z0-9_]+\.[a-z0-9_]+$/;
+const APPLE_TILE_TYPES = new Set(["hero", "toggle", "buttons", "vehicle", "calendar", "media"]);
+
+function applePageEntities(pages) {
+  return collectEntities(pages.map((page) => ({
+    ...page,
+    tiles: (Array.isArray(page?.tiles) ? page.tiles : []).filter((tile) => APPLE_TILE_TYPES.has(tile?.type)),
+  })));
+}
 
 const slugify = (s) =>
   String(s).toLowerCase().normalize("NFKD").replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "");
@@ -55,6 +61,7 @@ function parseMenuItems(raw, pages, errors) {
       continue;
     }
     const input = value.id.trim();
+    if (RETIRED_MENU_ITEMS.has(input)) continue;
     const id = builtins.has(input) || custom.has(input) ? input : `page:${input}`;
     if (!builtins.has(id) && !custom.has(id)) {
       errors.push(`${where}.id: "${input}" is not a built-in menu item or dashboard page id.`);
@@ -153,26 +160,12 @@ function parseMusic(raw, errors) {
   };
   const players = ids("players");
   const exclude = ids("exclude");
-  let defaultPlayer = r.default_player != null ? String(r.default_player) : null;
-  if (defaultPlayer && !(ENTITY_RE.test(defaultPlayer) && defaultPlayer.startsWith("media_player."))) {
-    errors.push(`music.default_player: not a media_player entity id: ${defaultPlayer}`);
-    defaultPlayer = null;
-  }
-  const tabs = toList(r.tabs).filter((tab) => {
-    const ok = MUSIC_TABS.includes(tab);
-    if (!ok) errors.push(`music.tabs: "${tab}" is not a tab. Use: ${MUSIC_TABS.join(", ")}.`);
-    return ok;
-  });
   return {
     enabled: r.enabled !== false,
     title: r.title != null ? String(r.title) : null,
     icon: String(r.icon ?? "music"),
-    tabs: tabs.length ? [...new Set(tabs)] : DEFAULT_TABS,
     players,
     exclude,
-    default_player: defaultPlayer,
-    fullscreen: r.fullscreen !== false,
-    config_entry_id: r.config_entry_id != null ? String(r.config_entry_id) : null,
   };
 }
 
@@ -217,164 +210,6 @@ function parseEv(raw, errors) {
   };
 }
 
-/** Normalise the optional `devices:` section (vacuums, washing machines, dryers, dishwashers, clothes heaters). */
-function parseDevices(raw, errors) {
-  const r = raw && typeof raw === "object" && !Array.isArray(raw) ? raw : {};
-  const ids = (key, domain) => {
-    const out = [];
-    for (const id of toList(r[key])) {
-      if (ENTITY_RE.test(id) && (!domain || id.startsWith(`${domain}.`))) out.push(id);
-      else errors.push(`devices.${key}: "${id}" is not ${domain ? `a ${domain} ` : "an "}entity id`);
-    }
-    return out;
-  };
-  const appliances = [];
-  for (const [i, a] of (Array.isArray(r.appliances) ? r.appliances : []).entries()) {
-    const where = `devices.appliances[${i}]`;
-    if (!a || typeof a !== "object" || !APPLIANCE_KINDS.includes(a.kind)) {
-      errors.push(`${where}: kind must be one of ${APPLIANCE_KINDS.join(", ")}.`);
-      continue;
-    }
-    const roles = {};
-    for (const role of APPLIANCE_ROLES) {
-      if (a[role] == null) continue;
-      if (ENTITY_RE.test(String(a[role]))) roles[role] = String(a[role]);
-      else errors.push(`${where}.${role}: invalid entity id "${a[role]}"`);
-    }
-    if (!roles.status_entity && !roles.power_entity) {
-      errors.push(`${where}: needs a status_entity or a power_entity.`);
-      continue;
-    }
-    appliances.push({ kind: a.kind, name: a.name != null ? String(a.name) : null, roles });
-  }
-  return {
-    enabled: r.enabled === false ? false : r.enabled === true ? true : "auto",
-    title: r.title != null ? String(r.title) : null,
-    icon: String(r.icon ?? "washing-machine"),
-    vacuums: ids("vacuums", "vacuum"),
-    exclude: ids("exclude"),
-    appliances,
-  };
-}
-
-/** Normalise the optional `meals:` section (the meal plan page). */
-function parseMeals(raw, errors) {
-  const r = raw && typeof raw === "object" && !Array.isArray(raw) ? raw : {};
-  const entity = (key, domain) => {
-    if (r[key] == null) return null;
-    const id = String(r[key]);
-    if (ENTITY_RE.test(id) && id.startsWith(`${domain}.`)) return id;
-    errors.push(`meals.${key}: "${id}" is not a ${domain} entity id`);
-    return null;
-  };
-  const time = /^([01]?\d|2[0-3]):[0-5]\d$/.test(String(r.dinner_time ?? "")) ? String(r.dinner_time).padStart(5, "0") : "18:00";
-  const auto = r.auto && typeof r.auto === "object" ? r.auto : null;
-  return {
-    enabled: r.enabled === false ? false : r.enabled === true ? true : "auto",
-    title: r.title != null ? String(r.title) : null,
-    icon: String(r.icon ?? "silverware-fork-knife"),
-    shopping_list_entity: entity("shopping_list_entity", "todo"),
-    calendar_entity: entity("calendar_entity", "calendar"),
-    ai_task_entity: entity("ai_task_entity", "ai_task"),
-    household: posInt(r.household, 4),
-    dinner_time: time,
-    language: r.language != null ? String(r.language).toLowerCase().slice(0, 2) : null,
-    offers: {
-      enabled: r.offers === false || r.offers?.enabled === false ? false : true,
-      count: Math.min(10, Math.max(1, posInt(r.offers?.count, 5))),
-    },
-    mealie: {
-      enabled: r.mealie === false || r.mealie?.enabled === false ? false : "auto",
-      config_entry_id: /^[A-Za-z0-9]{10,40}$/.test(String(r.mealie?.config_entry_id ?? "")) ? String(r.mealie.config_entry_id) : null,
-    },
-    auto: auto
-      ? {
-          weekday: ["mon", "tue", "wed", "thu", "fri", "sat", "sun"].includes(auto.weekday) ? auto.weekday : "sat",
-          time: /^([01]?\d|2[0-3]):[0-5]\d$/.test(String(auto.time ?? "")) ? String(auto.time).padStart(5, "0") : "08:00",
-          days: Math.min(14, posInt(auto.days, 7)),
-        }
-      : null,
-  };
-}
-
-/**
- * Normalise the optional `ambient:` section: the calm clock screen that takes over after a while without touch.
- * `ambient: 600` (seconds) is the short form; `ambient: false` or no section leaves it off.
- */
-function parseAmbient(raw, errors) {
-  const object = raw && typeof raw === "object" && !Array.isArray(raw);
-  const r = object ? raw : {};
-  const after = typeof raw === "number" || (typeof raw === "string" && raw.trim() !== "") ? Number(raw) : r.after != null ? Number(r.after) : object ? 600 : 0;
-  const buttons = [];
-  for (const [i, b] of (Array.isArray(r.buttons) ? r.buttons : []).entries()) {
-    if (!b || typeof b !== "object" || typeof b.icon !== "string") {
-      errors.push(`ambient.buttons[${i}]: a button needs an icon`);
-      continue;
-    }
-    if (b.entity != null && !ENTITY_RE.test(String(b.entity))) {
-      errors.push(`ambient.buttons[${i}].entity: invalid entity id "${b.entity}"`);
-      continue;
-    }
-    buttons.push({ icon: b.icon, name: b.name != null ? String(b.name) : null, ...(b.entity ? { entity: String(b.entity) } : {}), ...(b.tap != null ? { tap: b.tap } : {}), ...(b.active_when ? { active_when: b.active_when } : {}) });
-    if (buttons.length >= 4) break;
-  }
-  const enabled = r.enabled !== false && Number.isFinite(after) && after >= 10;
-  return {
-    enabled,
-    after: enabled ? Math.round(after) : 0,
-    buttons,
-    time_format: r.time_format === "12h" ? "12h" : "24h",
-    brightness: Number.isFinite(Number(r.brightness)) ? Math.min(1, Math.max(0.1, Number(r.brightness))) : 0.8,
-  };
-}
-
-/**
- * Normalise the optional `family:` section (the family board). Without the section there is no family page;
- * `family: true` (or an empty section) uses every `person` entity of Home Assistant as a person.
- */
-function parseFamily(raw, errors, optionChildren = []) {
-  if (raw == null || raw === false) return { enabled: false, people: [] };
-  const r = raw && typeof raw === "object" && !Array.isArray(raw) ? raw : {};
-  const people = [];
-  const seen = new Set();
-  for (const [i, p] of (Array.isArray(r.people) ? r.people : []).entries()) {
-    const o = p && typeof p === "object" ? p : {};
-    const entity = o.entity != null ? String(o.entity) : null;
-    if (entity && !(ENTITY_RE.test(entity) && entity.startsWith("person."))) {
-      errors.push(`family.people[${i}].entity: "${entity}" is not a person entity id`);
-      continue;
-    }
-    const calendar = o.calendar_entity != null ? String(o.calendar_entity) : null;
-    if (calendar && !(ENTITY_RE.test(calendar) && calendar.startsWith("calendar."))) errors.push(`family.people[${i}].calendar_entity: "${calendar}" is not a calendar entity id`);
-    let id = slugify(o.id ?? o.name ?? entity?.slice("person.".length) ?? "");
-    if (!id) {
-      errors.push(`family.people[${i}]: a person needs an entity or a name`);
-      continue;
-    }
-    while (seen.has(id)) id += "-x";
-    seen.add(id);
-    people.push({
-      id,
-      entity,
-      name: o.name != null ? String(o.name).slice(0, 30) : null,
-      color: /^#[0-9a-fA-F]{6}$/.test(String(o.color ?? "")) ? String(o.color) : null,
-      avatar: o.avatar != null ? String(o.avatar).slice(0, 8) : null,
-      role: o.role === "child" ? "child" : "adult",
-      pin: /^\d{3,8}$/.test(String(o.pin ?? "")) ? String(o.pin) : null,
-      calendar: calendar && ENTITY_RE.test(calendar) && calendar.startsWith("calendar.") ? calendar : null,
-    });
-    if (o.pin != null && !/^\d{3,8}$/.test(String(o.pin))) errors.push(`family.people[${i}].pin: use 3 to 8 digits`);
-  }
-  return {
-    enabled: r.enabled !== false,
-    title: r.title != null ? String(r.title) : null,
-    icon: String(r.icon ?? "account-group"),
-    allow_negative: r.allow_negative === true,
-    children: (toList(r.children).length ? toList(r.children) : optionChildren).filter((id) => ENTITY_RE.test(id) && id.startsWith("person.")),
-    people,
-  };
-}
-
 /**
  * Normalise the optional `calendar:` section (the calendar page with month and planner views). Off without the
  * section; `calendar: true` (or the app option) shows every calendar of Home Assistant.
@@ -406,26 +241,6 @@ function parseCalendarPage(raw, errors) {
   };
 }
 
-/** Normalise the optional `todo:` section (the to-do lists page). */
-function parseTodo(raw, errors) {
-  const r = raw && typeof raw === "object" && !Array.isArray(raw) ? raw : {};
-  const ids = (key) => {
-    const out = [];
-    for (const id of toList(r[key])) {
-      if (ENTITY_RE.test(id) && id.startsWith("todo.")) out.push(id);
-      else errors.push(`todo.${key}: "${id}" is not a todo entity id`);
-    }
-    return out;
-  };
-  return {
-    enabled: r.enabled === false ? false : r.enabled === true ? true : "auto",
-    title: r.title != null ? String(r.title) : null,
-    icon: String(r.icon ?? "format-list-checks"),
-    lists: ids("lists"),
-    exclude: ids("exclude"),
-  };
-}
-
 /** Normalise the optional `plex:` section (the Media page). */
 function parsePlex(raw, errors) {
   const r = raw && typeof raw === "object" && !Array.isArray(raw) ? raw : {};
@@ -443,7 +258,6 @@ function parsePlex(raw, errors) {
     icon: String(r.icon ?? "movie-open-outline"),
     players: ids("players"),
     exclude: ids("exclude"),
-    transcode: ["always", "never"].includes(r.transcode) ? r.transcode : "auto",
   };
 }
 
@@ -482,23 +296,12 @@ function parseEnergy(raw, errors) {
   };
 }
 
-function parseAlarms(raw, errors) {
-  const r = raw && typeof raw === "object" && !Array.isArray(raw) ? raw : {};
-  if (raw != null && typeof raw !== "boolean" && (typeof raw !== "object" || Array.isArray(raw))) errors.push("alarms: use true, false or a mapping.");
-  if (r.enabled != null && typeof r.enabled !== "boolean") errors.push("alarms.enabled: use true or false.");
-  return {
-    enabled: raw !== false && r.enabled !== false,
-    title: r.title != null ? String(r.title) : null,
-    icon: String(r.icon ?? "timer-outline"),
-  };
-}
-
 /**
  * Parse and normalise a dashboard.yaml document.
  * Never throws: problems end up in `errors` and offending tiles are dropped.
  */
-/** App menu overrides take precedence; the legacy Family/Calendar switches fill in missing sections. */
-export function parseConfig(text, { entityMap = {}, family: familyOption = {}, calendarPage: calendarPageOption = false, menuItems: menuItemsOption = [], weatherBackground: weatherBackgroundOption = true } = {}) {
+/** App menu overrides take precedence; the calendar switch fills in a missing section. */
+export function parseConfig(text, { entityMap = {}, calendarPage: calendarPageOption = false, menuItems: menuItemsOption = [], weatherBackground: weatherBackgroundOption = true } = {}) {
   const errors = [];
   const failed = (message) => ({ config: null, errors: [message], entities: new Set(), rawEntities: new Set(), usage: new Map() });
   let raw;
@@ -511,18 +314,12 @@ export function parseConfig(text, { entityMap = {}, family: familyOption = {}, c
   if (!Array.isArray(raw.pages) || raw.pages.length === 0) return failed("`pages` must be a non-empty list.");
 
   // The entities as written in the file, before the user's mapping replaces some of them.
-  const rawEntities = collectEntities(raw.pages);
+  const rawEntities = applePageEntities(raw.pages);
   collectEntities(raw.areas?.overrides ?? {}, rawEntities);
   collectEntities(raw.ev ?? {}, rawEntities);
   collectEntities(raw.climate ?? {}, rawEntities);
   for (const id of toList(raw.plex?.players)) rawEntities.add(id);
-  for (const id of toList(raw.devices?.vacuums)) rawEntities.add(id);
-  for (const id of toList(raw.todo?.lists)) rawEntities.add(id);
-  collectEntities(raw.meals ?? {}, rawEntities);
-  collectEntities(raw.ambient ?? {}, rawEntities);
-  collectEntities(raw.family ?? {}, rawEntities);
   collectEntities(raw.calendar ?? {}, rawEntities);
-  collectEntities(raw.devices?.appliances ?? [], rawEntities);
   for (const id of [...rawEntities]) if (!ENTITY_RE.test(id)) rawEntities.delete(id);
   const usage = describeUsage(raw);
   if (Object.keys(entityMap).length) raw = mapEntities(raw, entityMap);
@@ -596,17 +393,11 @@ export function parseConfig(text, { entityMap = {}, family: familyOption = {}, c
   const ev = parseEv(section("ev", raw.ev), errors);
   const climate = parseClimate(section("climate", raw.climate), errors);
   const energy = parseEnergy(section("energy", raw.energy), errors);
-  const alarms = parseAlarms(section("alarms", raw.alarms), errors);
   const plex = parsePlex(section("media", raw.plex), errors);
-  const devices = parseDevices(section("devices", raw.devices), errors);
-  const todo = parseTodo(section("todo", raw.todo), errors);
-  const meals = parseMeals(section("meals", raw.meals), errors);
-  const ambient = parseAmbient(raw.ambient, errors);
   const calendarPage = parseCalendarPage(section("calendar", raw.calendar === undefined && calendarPageOption ? true : raw.calendar), errors);
-  const family = parseFamily(section("family", raw.family === undefined && familyOption.enabled ? true : raw.family), errors, familyOption.children ?? []);
 
   const config = {
-    title: String(raw.title ?? "Dasher"),
+    title: String(raw.title ?? "Dasher Apple"),
     language: String(raw.language ?? "en"),
     locale: raw.locale ? String(raw.locale) : null,
     accent: String(raw.accent ?? "#2dd4bf"),
@@ -616,13 +407,7 @@ export function parseConfig(text, { entityMap = {}, family: familyOption = {}, c
     ev,
     climate,
     energy,
-    alarms,
     plex,
-    devices,
-    todo,
-    meals,
-    ambient,
-    family,
     calendar: calendarPage,
     menu_items: menuItems,
     pages,
@@ -633,31 +418,24 @@ export function parseConfig(text, { entityMap = {}, family: familyOption = {}, c
     if (item?.icon) config[section].icon = item.icon;
   }
 
-  const entities = collectEntities(pages);
+  const entities = applePageEntities(pages);
   collectEntities(areas.overrides, entities);
   for (const id of Object.values(ev.roles)) entities.add(id);
   for (const id of climate.entities) entities.add(id);
   for (const id of plex.players) entities.add(id);
-  for (const id of devices.vacuums) entities.add(id);
-  for (const id of todo.lists) entities.add(id);
-  for (const id of [meals.shopping_list_entity, meals.calendar_entity, meals.ai_task_entity]) if (id) entities.add(id);
-  collectEntities(ambient, entities);
-  collectEntities(family.people, entities);
   for (const id of calendarPage.entities ?? []) entities.add(id);
-  for (const a of devices.appliances) for (const id of Object.values(a.roles)) entities.add(id);
-  for (const id of [...music.players, music.default_player]) if (id) entities.add(id);
+  for (const id of music.players) entities.add(id);
   return { config, errors, entities, rawEntities, usage };
 }
 
 /** Watches dashboard.yaml and keeps the parsed result current. */
 export class ConfigStore {
   /** `entityMapOption`: the app option `entity_map` (a list of { from, to }). */
-  constructor({ dir, onChange, logger, entityMapOption = [], familyOption = {}, calendarPageOption = false, menuItemsOption = [], weatherBackgroundOption = true }) {
+  constructor({ dir, onChange, logger, entityMapOption = [], calendarPageOption = false, menuItemsOption = [], weatherBackgroundOption = true }) {
     this.weatherBackgroundOption = weatherBackgroundOption !== false;
     this.menuItemsOption = menuItemsOption;
     this.calendarPageOption = calendarPageOption === true;
     this.dir = dir;
-    this.familyOption = { enabled: familyOption.enabled === true, children: Array.isArray(familyOption.children) ? familyOption.children.map(String) : [] };
     this.optionMap = parseEntityMapOption(entityMapOption);
     this._legacyLogged = false;
     this.file = path.join(dir, "dashboard.yaml");
@@ -704,7 +482,7 @@ export class ConfigStore {
       return this.current;
     }
     this.entityMap = this._readEntityMap();
-    this.current = parseConfig(text, { entityMap: this.entityMap, family: this.familyOption, calendarPage: this.calendarPageOption, menuItems: this.menuItemsOption, weatherBackground: this.weatherBackgroundOption });
+    this.current = parseConfig(text, { entityMap: this.entityMap, calendarPage: this.calendarPageOption, menuItems: this.menuItemsOption, weatherBackground: this.weatherBackgroundOption });
     for (const e of this.current.errors) this.log.warn(`${e.startsWith("menu_items") ? "App configuration" : "dashboard.yaml"}: ${e}`);
     return this.current;
   }

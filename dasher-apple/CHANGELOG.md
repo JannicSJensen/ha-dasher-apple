@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.2.0
+
+- Remove inherited meal, family, to-do, library-browsing and editing APIs and background jobs that the Apple dashboard does not use. Existing saved data is left untouched.
+- Keep supported dashboard faces, basic media controls, read-only calendar, device controls and migrated dashboard YAML.
+
 ## 0.1.0
 
 - Initial independent Dasher Apple app, based on Dasher 0.53.0.

@@ -3,15 +3,12 @@ export const BUILTIN_MENU_ITEMS = [
   { id: "areas", section: "areas", title: "areas" },
   { id: "music", section: "music", title: "music" },
   { id: "calendar", section: "calendar", title: "calp_title" },
-  { id: "family", section: "family", title: "fam_title" },
-  { id: "meals", section: "meals", title: "meals_title" },
-  { id: "todo", section: "todo", title: "todo_title" },
-  { id: "devices", section: "devices", title: "dev_devices" },
   { id: "media", section: "plex", title: "plex_media" },
   { id: "ev", section: "ev", title: "ev_car" },
   { id: "energy", section: "energy", title: "energy_title" },
-  { id: "alarms", section: "alarms", title: "alarm_title" },
 ];
+
+export const RETIRED_MENU_ITEMS = new Set(["family", "meals", "todo", "devices", "alarms"]);
 
 export function menuItems(config, state, t, { includePending = false } = {}) {
   const overrides = new Map((config.menu_items ?? []).map((item) => [item.id, item]));
@@ -26,7 +23,7 @@ export function menuItems(config, state, t, { includePending = false } = {}) {
     return {
       key: item.id, kind: item.section, id: null,
       href: `#/${item.id}`, title: settings?.title ?? t(item.title), icon: settings?.icon,
-      enabled: settings?.enabled !== false && (["calendar", "alarms"].includes(item.id) ? settings?.enabled : model?.enabled || pending),
+      enabled: settings?.enabled !== false && (item.id === "calendar" ? settings?.enabled : model?.enabled || pending),
     };
   });
   return [...pages, ...builtins]
@@ -37,14 +34,13 @@ export function menuItems(config, state, t, { includePending = false } = {}) {
 
 export function menuRoute(hash, items) {
   const raw = hash.replace(/^#\/?/, "");
-  const target = raw === "radio" ? "music" : raw.startsWith("area/") ? "areas" : raw.startsWith("todo/") ? "todo" : raw;
+  const target = raw === "radio" ? "music" : raw.startsWith("area/") ? "areas" : raw;
   // Built-in routes take precedence over dashboard pages with the same id.
   const item = items.find((i) => i.kind !== "page" && i.href === `#/${target}`)
     ?? items.find((i) => i.kind === "page" && i.href === `#/${raw}`)
     ?? items[0];
   if (!item) return { kind: "empty", id: null };
   if (item.kind === "areas" && raw.startsWith("area/")) return { kind: "area", id: decodeURIComponent(raw.slice(5)) };
-  if (item.kind === "todo" && raw.startsWith("todo/")) return { kind: "todo", id: decodeURIComponent(raw.slice(5)) };
   return { kind: item.kind, id: item.id };
 }
 
